@@ -78,6 +78,10 @@ def default_approach2_config() -> ApproachConfig:
                 "random_state": 42,
                 "model_path": "models/clustpsg_svm.pkl",
             },
+
+            # PR8 pipeline limits (runtime control during development)
+            "doc_content_topk": 100,
+            "clustering_max_passages": 200,
         },
         candidates_depth=None,
     )

@@ -5,6 +5,7 @@ import logging
 from typing import List
 
 from rag.approaches.approach1 import bm25_retrieve
+from rag.clustpsg.pipeline import clustpsg_run
 from rag.eval import load_trec_run, mean_average_precision
 from rag.io import Query, load_queries
 from rag.logging_utils import configure_logging
@@ -24,7 +25,7 @@ def _split_queries(queries: List[Query], split: str, train_topics: int = 50) -> 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="ROBUST04 retrieval runner (Pyserini).")
-    p.add_argument("--approach", choices=["bm25"], default="bm25")
+    p.add_argument("--approach", choices=["bm25", "clustpsg"], default="bm25")
     p.add_argument("--split", choices=["train", "test", "all"], default="train")
     p.add_argument("--queries", default="queriesROBUST.txt", help="Path to queries file.")
     p.add_argument("--output", required=True, help="Output run file path (TREC format).")
@@ -44,6 +45,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--qrels", default="qrels_50_Queries", help="Path to qrels file (train topics).")
     p.add_argument("--eval-k", type=int, default=1000, help="Evaluation cutoff depth (default: 1000).")
     p.add_argument("--per-topic", action="store_true", help="If evaluating, also print per-topic AP.")
+
+    # clustpsg (Approach 2) training control
+    p.add_argument("--train-model", action="store_true", help="If --approach clustpsg and split=train, train and save the SVM model.")
     return p
 
 
@@ -65,6 +69,18 @@ def main() -> int:
             k1=args.k1,
             b=args.b,
         )
+    elif args.approach == "clustpsg":
+        # clustpsg returns (docid, score) tuples; convert to run-writer-compatible entries
+        run = clustpsg_run(
+            queries=queries,
+            searcher=searcher,
+            topk=args.topk,
+            split=args.split,
+            qrels_path=args.qrels,
+            train_model=args.train_model,
+            logger=log,
+        )
+        results_by_topic = {tid: [{"docid": docid, "score": score} for docid, score in pairs] for tid, pairs in run.items()}
     else:
         raise ValueError("Unknown approach: {0}".format(args.approach))
 
