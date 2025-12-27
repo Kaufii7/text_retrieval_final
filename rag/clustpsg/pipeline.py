@@ -24,6 +24,7 @@ from rag.clustpsg.model import load_model, save_model, score_documents, train_li
 from rag.clustpsg.passage_extraction import passages_by_topic
 from rag.clustpsg.passage_retrieval import rank_passages
 from rag.io import load_qrels
+from rag.training_utils import augment_candidates_with_qrels
 from rag.types import Document, Query
 
 
@@ -75,18 +76,30 @@ def clustpsg_run(
 
     # Limits to keep runtime sane during development.
     doc_content_topk = int(params.get("doc_content_topk", 100))
+    train_doc_content_topk = params.get("train_doc_content_topk", None)
+    if train_doc_content_topk is None:
+        train_doc_content_topk = doc_content_topk
+    else:
+        train_doc_content_topk = int(train_doc_content_topk)
     clustering_max_passages = int(params.get("clustering_max_passages", 200))
+    train_include_all_qrels_docs = bool(params.get("train_include_all_qrels_docs", True))
 
     # 1) Candidate documents
     doc_candidates_by_topic = retrieve_doc_candidates(
         queries=queries, searcher=searcher, topk=topk, config=cfg, logger=log
     )
 
+    # If training, include all judged qrels docids as additional candidates (can be > topk).
+    qrels = load_qrels(qrels_path) if split == "train" else {}
+    if split == "train" and train_include_all_qrels_docs:
+        doc_candidates_by_topic = augment_candidates_with_qrels(candidates_by_topic=doc_candidates_by_topic, qrels=qrels)
+
     # 2) Fetch doc contents for passage extraction (cap by doc_content_topk)
     docs_with_content_by_topic: Dict[int, List[Document]] = {}
     for topic_id in sorted(doc_candidates_by_topic.keys()):
         docs = doc_candidates_by_topic[topic_id]
-        docs_with_content_by_topic[topic_id] = _with_contents(searcher=searcher, docs=docs, topk=doc_content_topk)
+        cap = train_doc_content_topk if split == "train" else doc_content_topk
+        docs_with_content_by_topic[topic_id] = _with_contents(searcher=searcher, docs=docs, topk=cap)
 
     # 3) Extract passages
     extracted_passages_by_topic = passages_by_topic(docs_with_content_by_topic, cfg=cfg)
@@ -104,7 +117,6 @@ def clustpsg_run(
         clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
 
     # 6) Build doc-level instances (labels only needed for training/eval)
-    qrels = load_qrels(qrels_path) if split == "train" else {}
     instances, feature_names = build_doc_level_training_set(
         queries=queries,
         qrels=qrels,

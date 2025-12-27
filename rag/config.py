@@ -82,6 +82,12 @@ def default_approach2_config() -> ApproachConfig:
             # PR8 pipeline limits (runtime control during development)
             "doc_content_topk": 100,
             "clustering_max_passages": 200,
+
+            # Training-time: include *all* judged qrels docids as candidates, even if retrieval is top-k capped.
+            "train_include_all_qrels_docs": True,
+            # When split=train, how many candidate docs to fetch full content for passage extraction.
+            # If None, uses doc_content_topk.
+            "train_doc_content_topk": None,
         },
         candidates_depth=None,
     )
