@@ -57,7 +57,11 @@ def default_approach2_config() -> ApproachConfig:
             },
 
             # Feature selection / extensibility (PR5): list of enabled feature names.
+            # If empty, treat as "all registered features".
             "enabled_features": [],
+            # Feature extraction knobs (PR5)
+            "feature_max_pairwise_sim": 2000,
+            # Optional: provide your own stopword list later; for now features use a small built-in set.
         },
         candidates_depth=None,
     )
