@@ -1,4 +1,4 @@
-"""BM25 baseline retrieval (Approach 1).
+"""Approach 1 — BM25 baseline retrieval.
 
 This module implements a thin approach layer that:
 - takes a list of queries
@@ -8,7 +8,7 @@ This module implements a thin approach layer that:
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Dict, List, Mapping, Sequence
 
 from rag.io import Query
 from rag.lucene_backend import SearchHit, search, set_bm25

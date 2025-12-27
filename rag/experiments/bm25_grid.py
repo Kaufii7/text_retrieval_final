@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence, Tuple
 
-from rag.approaches.bm25 import bm25_retrieve
+from rag.approaches.approach1 import bm25_retrieve
 from rag.eval import mean_average_precision
 from rag.io import Query, load_qrels, load_queries
 from rag.logging_utils import configure_logging

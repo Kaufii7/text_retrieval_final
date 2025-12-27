@@ -4,7 +4,7 @@ import argparse
 import logging
 from typing import List
 
-from rag.approaches.bm25 import bm25_retrieve
+from rag.approaches.approach1 import bm25_retrieve
 from rag.eval import load_trec_run, mean_average_precision
 from rag.io import Query, load_queries
 from rag.logging_utils import configure_logging

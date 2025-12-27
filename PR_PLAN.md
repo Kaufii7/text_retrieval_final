@@ -100,11 +100,11 @@ This document decomposes `PROJECT_PLAN.md` into **small, committable PRs**. Each
     - `--split train|test|all` (train = first 50 topics, test = remaining, all = everything)
     - `--output`, `--run-tag`, `--topk` (default 1000), `--log-level`
     - BM25 params `--k1`, `--b`
-  - Implement `rag/approaches/bm25.py` as the approach function used by `main.py`.
+  - Implement `rag/approaches/approach1.py` as the approach function used by `main.py`.
   - Ensure deterministic output ordering.
 - **Files**
   - `main.py`
-  - `rag/approaches/bm25.py`
+  - `rag/approaches/approach1.py`
   - (uses) `rag/io.py`, `rag/lucene_backend.py`, `rag/runs.py`, `rag/logging_utils.py`
 - **Acceptance**
   - `python main.py --approach bm25 --split train --output run_1_train.res --run-tag run1`
@@ -150,14 +150,14 @@ This document decomposes `PROJECT_PLAN.md` into **small, committable PRs**. Each
 - **Goal**: add a **template** for Approach 2 that establishes the interface, config surface, and wiring pattern.
 - **Constraint**: this PR is **not required to be competitive** and does **not** need a novel retrieval method yet.
 - **Changes**
-  - Add `rag/approaches/approach2_template.py` (or similar) that defines:
+  - Add `rag/approaches/approach2.py` that defines:
     - a clear function signature (inputs: queries, searcher, topk, config/params)
     - return structure compatible with `rag.runs.write_trec_run`
     - deterministic behavior requirements documented
   - Add minimal `rag/config.py` placeholders for approach2 params (optional).
   - (Optional) Add `--approach approach2` **only if** it can safely run (even if it is just BM25-copy baseline under a different tag), otherwise do **not** add it to `main.py` yet.
 - **Files**
-  - `rag/approaches/approach2_template.py` (name can vary)
+  - `rag/approaches/approach2.py`
   - `rag/config.py` (optional)
   - `main.py` (optional; only if approach2 is runnable)
 - **Acceptance**
