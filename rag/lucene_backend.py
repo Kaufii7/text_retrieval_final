@@ -46,6 +46,14 @@ def set_bm25(searcher, k1: float, b: float) -> None:
     searcher.set_bm25(k1=k1, b=b)
 
 
+def set_qld(searcher, mu: float) -> None:
+    """Set Query Likelihood with Dirichlet smoothing (QLD) on a LuceneSearcher."""
+    if mu <= 0:
+        raise ValueError("mu must be > 0")
+    # Pyserini exposes QLD via LuceneSearcher.set_qld(mu)
+    searcher.set_qld(mu)
+
+
 def search(searcher, query: str, topk: int = 1000) -> List[SearchHit]:
     """Execute a search and normalize results.
 
