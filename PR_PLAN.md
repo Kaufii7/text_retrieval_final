@@ -145,39 +145,47 @@ This document decomposes `PROJECT_PLAN.md` into **small, committable PRs**. Each
 
 ---
 
-### PR 9 — Approach 2 (fully working, not a placeholder)
+### PR 9 — Approach 2 (template / skeleton; not a final method yet)
 
-- **Goal**: implement a second, complete method that can generate `run_2.res`.
-- **Constraint**: this PR must include everything needed for the approach to run end-to-end (no “TBD”).
-- **Changes (examples, pick one)**
-  - **Query expansion** (RM3 / pseudo-relevance feedback) using Pyserini utilities, OR
-  - **Hybrid retrieval** (BM25 + dense) if allowed by constraints, OR
-  - **BM25 variants** (e.g., fielded, doc2query expansions) if you have resources.
-  - Add `--approach approach2` with flags gated to that approach.
+- **Goal**: add a **template** for Approach 2 that establishes the interface, config surface, and wiring pattern.
+- **Constraint**: this PR is **not required to be competitive** and does **not** need a novel retrieval method yet.
+- **Changes**
+  - Add `rag/approaches/approach2_template.py` (or similar) that defines:
+    - a clear function signature (inputs: queries, searcher, topk, config/params)
+    - return structure compatible with `rag.runs.write_trec_run`
+    - deterministic behavior requirements documented
+  - Add minimal `rag/config.py` placeholders for approach2 params (optional).
+  - (Optional) Add `--approach approach2` **only if** it can safely run (even if it is just BM25-copy baseline under a different tag), otherwise do **not** add it to `main.py` yet.
 - **Files**
-  - `rag/approaches/approach2_*.py`
-  - `main.py` (flag-gated approach selection)
-  - `rag/config.py` (optional; only if used)
+  - `rag/approaches/approach2_template.py` (name can vary)
+  - `rag/config.py` (optional)
+  - `main.py` (optional; only if approach2 is runnable)
 - **Acceptance**
-  - `python main.py --approach approach2 --split train --output run_2_train.res --run-tag run2`
-  - MAP can be computed; outputs are deterministic.
+  - Repo remains merge-safe: default `--approach bm25` path is unchanged.
+  - The new template is importable and documented, and does not break existing code.
 
 ---
 
-### PR 10 — Approach 3 (advanced; multi-stage or fusion; fully working)
+### PR 10 — Approach 3 (template / skeleton; “advanced slot” placeholder)
 
-- **Goal**: implement the “advanced” run as a complete method generating `run_3.res`.
-- **Changes (examples)**
-  - **Two-stage retrieval**: BM25 candidate generation → rerank with a cross-encoder (if allowed), OR
-  - **Fusion**: combine multiple candidate lists (e.g., BM25 variants) with Reciprocal Rank Fusion (RRF), OR
-  - **Learning-to-rank** (only if feasible within constraints).
+- **Goal**: add a **template** for the “advanced” Approach 3 (multi-stage / fusion / reranking slot), without committing to the final method yet.
+- **Constraint**: this PR is **not required** to produce a strong run. It primarily establishes structure and extension points.
+- **Changes**
+  - Add `rag/approaches/approach3_template.py` (or similar) that defines:
+    - candidate generation depth concept (e.g., `candidates_depth`)
+    - optional fusion/rerank hook points
+    - deterministic output requirements
+  - Add placeholder config sections for approach3 (optional).
+  - (Optional) Add a small `rag/fusion.py` with a skeleton fusion function (e.g., signature only + docstring), if helpful for later.
+  - Do **not** wire into `main.py` unless it can run end-to-end safely.
 - **Files**
-  - `rag/approaches/approach3_*.py`
-  - (optional) `rag/fusion.py`
-  - `main.py` (new approach selection)
+  - `rag/approaches/approach3_template.py` (name can vary)
+  - `rag/fusion.py` (optional)
+  - `rag/config.py` (optional)
+  - `main.py` (optional; only if runnable)
 - **Acceptance**
-  - `python main.py --approach approach3 --split test --output run_3.res --run-tag run3`
-  - Output is valid TREC format and deterministic.
+  - Repo remains merge-safe: default `--approach bm25` path is unchanged.
+  - Templates are importable and documented; no impact unless explicitly used.
 
 ---
 
