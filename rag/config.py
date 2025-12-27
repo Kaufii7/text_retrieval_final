@@ -62,6 +62,13 @@ def default_approach2_config() -> ApproachConfig:
             # Feature extraction knobs (PR5)
             "feature_max_pairwise_sim": 2000,
             # Optional: provide your own stopword list later; for now features use a small built-in set.
+
+            # PR6 label/aggregation settings (doc-level LTR)
+            # Label is derived from qrels: label = 1 if rel >= threshold else 0
+            "label_rel_threshold": 1,
+            # How to aggregate cluster-level features into a per-document feature vector:
+            # max | sum | mean
+            "doc_feature_aggregation": "max",
         },
         candidates_depth=None,
     )
