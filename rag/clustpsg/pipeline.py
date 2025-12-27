@@ -14,6 +14,7 @@ Pipeline (per query):
 from __future__ import annotations
 
 import logging
+import json
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from rag.config import ApproachConfig, default_approach2_config
@@ -33,11 +34,32 @@ def _fetch_doc_contents(searcher, docid: str) -> str:
     d = searcher.doc(docid)
     if d is None:
         return ""
+    # Prefer actual contents if available; raw() is often JSON and is poor for sentence splitting.
     try:
-        raw = d.raw()
+        if hasattr(d, "contents"):
+            c = d.contents()
+            if c:
+                return c
+    except Exception:
+        pass
+
+    raw = ""
+    try:
+        raw = d.raw() or ""
     except Exception:
         raw = ""
-    return raw or ""
+
+    # If raw looks like JSON with a "contents" field, extract it.
+    if raw and raw.lstrip().startswith("{"):
+        try:
+            obj = json.loads(raw)
+            c = obj.get("contents") or obj.get("raw") or ""
+            if isinstance(c, str) and c:
+                return c
+        except Exception:
+            pass
+
+    return raw
 
 
 def _with_contents(
@@ -146,11 +168,38 @@ def clustpsg_run(
     scores = score_documents(model=m, instances=instances)
     run: Dict[int, List[Tuple[str, float]]] = {}
     for topic_id, docs in doc_candidates_by_topic.items():
-        pairs: List[Tuple[str, float]] = []
-        for d in docs:
-            pairs.append((d.id, float(scores.get((topic_id, d.id), 0.0))))
-        pairs.sort(key=lambda x: (-x[1], x[0]))
-        run[topic_id] = pairs[:topk]
+        # Tie-break by original retrieval order, not docid (keeps behavior closer to baseline).
+        orig_rank = {d.id: i for i, d in enumerate(docs, start=1)}
+
+        rerank_cfg = (params.get("rerank") or {})
+        rerank_topn = int(rerank_cfg.get("topn", 200))
+        alpha = float(rerank_cfg.get("alpha", 0.2))
+        if rerank_topn < 0:
+            rerank_topn = 0
+        if alpha < 0.0:
+            alpha = 0.0
+        if alpha > 1.0:
+            alpha = 1.0
+
+        # Baseline score: use retrieval score if present, else 0.0 for appended qrels docs.
+        baseline = {d.id: float(d.score) if d.score is not None else 0.0 for d in docs}
+
+        # Only rerank within top-N. Outside that window, keep baseline ordering.
+        head = docs[:rerank_topn]
+        tail = docs[rerank_topn:]
+
+        head_pairs: List[Tuple[str, float]] = []
+        for d in head:
+            svm_s = float(scores.get((topic_id, d.id), 0.0))
+            final = alpha * svm_s + (1.0 - alpha) * baseline.get(d.id, 0.0)
+            head_pairs.append((d.id, final))
+        head_pairs.sort(key=lambda x: (-x[1], orig_rank.get(x[0], 10**9)))
+
+        # Tail: keep original order but emit a deterministic score (baseline).
+        tail_pairs = [(d.id, baseline.get(d.id, 0.0)) for d in tail]
+
+        merged = head_pairs + tail_pairs
+        run[topic_id] = merged[:topk]
 
     return run
 

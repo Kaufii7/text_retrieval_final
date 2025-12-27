@@ -88,6 +88,15 @@ def default_approach2_config() -> ApproachConfig:
             # When split=train, how many candidate docs to fetch full content for passage extraction.
             # If None, uses doc_content_topk.
             "train_doc_content_topk": None,
+
+            # PR8 reranking control: keep clustpsg from wrecking a strong baseline.
+            # - Only rerank within the top-N retrieved documents.
+            # - Blend SVM score with baseline retrieval score.
+            "rerank": {
+                "topn": 200,
+                # final = alpha * svm + (1-alpha) * baseline
+                "alpha": 0.2,
+            },
         },
         candidates_depth=None,
     )
