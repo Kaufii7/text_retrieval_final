@@ -69,6 +69,15 @@ def default_approach2_config() -> ApproachConfig:
             # How to aggregate cluster-level features into a per-document feature vector:
             # max | sum | mean
             "doc_feature_aggregation": "max",
+
+            # PR7 SVM hyperparameters / persistence
+            "svm": {
+                "C": 1.0,
+                "class_weight": "balanced",  # "balanced" | None
+                "max_iter": 5000,
+                "random_state": 42,
+                "model_path": "models/clustpsg_svm.pkl",
+            },
         },
         candidates_depth=None,
     )
