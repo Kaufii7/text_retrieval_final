@@ -16,7 +16,8 @@ from typing import Iterable, List, Sequence, Tuple
 
 from rag.approaches.approach1 import bm25_retrieve
 from rag.eval import mean_average_precision
-from rag.io import Query, load_qrels, load_queries
+from rag.io import load_qrels, load_queries
+from rag.types import Query
 from rag.logging_utils import configure_logging
 from rag.lucene_backend import get_searcher
 

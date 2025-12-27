@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Mapping, Sequence
 
-from rag.io import Query
+from rag.types import Query
 from rag.lucene_backend import SearchHit, search, set_bm25
 
 

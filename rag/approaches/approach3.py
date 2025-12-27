@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import Dict, List, Mapping, Optional, Sequence
 
 from rag.config import ApproachConfig, default_approach3_config
-from rag.io import Query
+from rag.types import Query
 
 
 def approach3_retrieve(

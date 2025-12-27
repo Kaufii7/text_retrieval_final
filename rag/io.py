@@ -7,14 +7,9 @@ Expected inputs in this repo:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
 
-
-@dataclass(frozen=True)
-class Query:
-    topic_id: int
-    text: str
+from rag.types import Query
 
 
 def _iter_nonempty_lines(path: str) -> Iterable[Tuple[int, str]]:
@@ -56,7 +51,7 @@ def load_queries(path: str) -> List[Query]:
         if topic_id in seen_topics:
             raise ValueError(f"{path}:{line_no}: duplicate topic_id={topic_id}")
         seen_topics.add(topic_id)
-        queries.append(Query(topic_id=topic_id, text=query_text))
+        queries.append(Query(id=topic_id, content=query_text))
 
     queries.sort(key=lambda q: q.topic_id)
     return queries
