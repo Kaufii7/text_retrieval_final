@@ -1,10 +1,10 @@
-"""Approach 2 template (placeholder).
+"""Approach 2 — `clustpsg` template (placeholder).
 
-This module is a *template* for a second run. It is intentionally not a final
-method yet. The goal is to establish:
-- a clear function signature
-- a deterministic output contract
-- a configuration surface
+General idea (planned): re-rank passages by clustering them, converting each
+cluster into a feature vector, and learning feature weights using an SVM, trained
+from doc-level binary relevance labels (qrels for the first 50 topics).
+
+This file remains a *template* until the PR roadmap in `APPROACH2.md` is implemented.
 
 Output contract (important):
 - Return `results_by_topic` compatible with `rag.runs.write_trec_run`, i.e.
@@ -21,17 +21,17 @@ from __future__ import annotations
 from typing import Dict, List, Mapping, Optional, Sequence
 
 from rag.config import ApproachConfig, default_approach2_config
-from rag.io import Query
+from rag.types import Query
 
 
-def approach2_retrieve(
+def clustpsg_retrieve(
     *,
     queries: Sequence[Query],
     searcher,
     topk: int = 1000,
     config: Optional[ApproachConfig] = None,
 ) -> Dict[int, List[Mapping[str, object]]]:
-    """Template retrieval function for Approach 2.
+    """Template retrieval function for Approach 2 (`clustpsg`).
 
     Args:
         queries: list of queries (topic_id + text)
@@ -51,7 +51,7 @@ def approach2_retrieve(
         config = default_approach2_config()
 
     raise NotImplementedError(
-        "Approach 2 is a template only. Implement your method here. "
+        "Approach 2 (`clustpsg`) is a template only. Implement your method here. "
         f"(config.name={config.name!r}, params={config.params!r})"
     )
 
