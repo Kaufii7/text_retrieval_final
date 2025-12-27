@@ -5,6 +5,7 @@ import logging
 from typing import List
 
 from rag.approaches.bm25 import bm25_retrieve
+from rag.eval import load_trec_run, mean_average_precision
 from rag.io import Query, load_queries
 from rag.logging_utils import configure_logging
 from rag.lucene_backend import get_searcher
@@ -37,6 +38,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Index
     p.add_argument("--index", default="robust04", help="Pyserini prebuilt index name.")
+
+    # Evaluation (optional)
+    p.add_argument("--evaluate", action="store_true", help="Evaluate the produced run with qrels (MAP).")
+    p.add_argument("--qrels", default="qrels_50_Queries", help="Path to qrels file (train topics).")
+    p.add_argument("--eval-k", type=int, default=1000, help="Evaluation cutoff depth (default: 1000).")
+    p.add_argument("--per-topic", action="store_true", help="If evaluating, also print per-topic AP.")
     return p
 
 
@@ -68,6 +75,17 @@ def main() -> int:
         topk=args.topk,
     )
     log.info("Wrote run file: %s", args.output)
+
+    if args.evaluate:
+        from rag.io import load_qrels
+
+        qrels = load_qrels(args.qrels)
+        run = load_trec_run(args.output, k=args.eval_k)
+        map_value, ap_by_topic = mean_average_precision(qrels, run, k=args.eval_k)
+        print(f"MAP@{args.eval_k}: {map_value:.6f}")
+        if args.per_topic:
+            for topic_id in sorted(ap_by_topic.keys()):
+                print(f"{topic_id}\t{ap_by_topic[topic_id]:.6f}")
     return 0
 
 
