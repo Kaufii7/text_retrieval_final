@@ -171,7 +171,7 @@ This document decomposes `PROJECT_PLAN.md` into **small, committable PRs**. Each
 - **Goal**: add a **template** for the “advanced” Approach 3 (multi-stage / fusion / reranking slot), without committing to the final method yet.
 - **Constraint**: this PR is **not required** to produce a strong run. It primarily establishes structure and extension points.
 - **Changes**
-  - Add `rag/approaches/approach3_template.py` (or similar) that defines:
+  - Add `rag/approaches/approach3.py` that defines:
     - candidate generation depth concept (e.g., `candidates_depth`)
     - optional fusion/rerank hook points
     - deterministic output requirements
@@ -179,7 +179,7 @@ This document decomposes `PROJECT_PLAN.md` into **small, committable PRs**. Each
   - (Optional) Add a small `rag/fusion.py` with a skeleton fusion function (e.g., signature only + docstring), if helpful for later.
   - Do **not** wire into `main.py` unless it can run end-to-end safely.
 - **Files**
-  - `rag/approaches/approach3_template.py` (name can vary)
+  - `rag/approaches/approach3.py`
   - `rag/fusion.py` (optional)
   - `rag/config.py` (optional)
   - `main.py` (optional; only if runnable)

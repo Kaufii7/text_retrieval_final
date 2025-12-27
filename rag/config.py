@@ -31,3 +31,16 @@ def default_approach2_config() -> ApproachConfig:
     )
 
 
+def default_approach3_config() -> ApproachConfig:
+    """Default (placeholder) config for Approach 3."""
+    return ApproachConfig(
+        name="approach3_template",
+        params={
+            # Put approach-specific knobs here (placeholder).
+            # Example: "rrf_k": 60
+        },
+        # For multi-stage methods, candidates_depth is often > topk (e.g., 2000-5000).
+        candidates_depth=2000,
+    )
+
+

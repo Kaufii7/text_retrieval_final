@@ -2,5 +2,6 @@
 
 # Templates:
 # - `approach2.py`: placeholder skeleton for run_2
+# - `approach3.py`: placeholder skeleton for run_3
 
 
