@@ -95,6 +95,7 @@ text_retrieval_final/
   qrels_50_Queries
   rag/
     __init__.py
+    types.py
     config.py
     io.py
     logging_utils.py
@@ -133,6 +134,18 @@ text_retrieval_final/
 ---
 
 ## Shared utilities (core requirements)
+
+### Core dataclasses (`rag/types.py`)
+
+- Implement a small set of **generic, reusable dataclasses** used across all approaches:
+  - `Query(id, content)`
+  - `Document(id, content, score=None)`
+  - `Passage(document_id, index, content, score=None)`
+- **Goal**: standardize data interchange between modules (retrieval, reranking, fusion, evaluation) and reduce ad-hoc dict usage.
+- **Guidelines**:
+  - Keep them lightweight and immutable (`frozen=True`) where possible.
+  - Avoid backend-specific dependencies (no Pyserini types here).
+  - Make fields explicit and typed; prefer `Optional[float]` for scores.
 
 ### Logging (`rag/logging_utils.py`)
 
@@ -179,10 +192,21 @@ text_retrieval_final/
 
 ### Phase 1 — Baseline sanity check
 
-- Implement query loading + Lucene searcher + TREC run writer.
+- Implement **core dataclasses** (`rag/types.py`) + query loading + Lucene searcher + TREC run writer.
 - Generate a BM25 run for:
   - first 50 queries (train) → evaluate MAP
   - all 249 queries (full) → verify output formatting and top-1000 completeness
+
+---
+
+## Additional PR — Shared dataclasses for reuse across approaches
+
+**What**: add `rag/types.py` implementing reusable dataclasses like `Document`, `Passage`, `Query` for consistent internal representations.
+
+- **Why**: Approach 2/3 will likely involve multi-stage retrieval (candidates → rerank) and/or fusion, which benefits from shared, typed structures.
+- **Acceptance**:
+  - The dataclasses are imported and used by utilities/approaches instead of ad-hoc dicts where practical.
+  - No approach behavior changes required; this is a refactor / foundation PR.
 
 ### Phase 2 — Approach 2 (TBD)
 

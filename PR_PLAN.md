@@ -202,5 +202,3 @@ This document decomposes `PROJECT_PLAN.md` into **small, committable PRs**. Each
   - `REPRODUCIBILITY.md`
 - **Acceptance**
   - One command produces the three `.res` files and the final zip.
-
-
