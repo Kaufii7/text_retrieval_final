@@ -34,7 +34,24 @@ def default_approach2_config() -> ApproachConfig:
             "min_sentences": 3,
             "max_sentences": 5,
             "stride_sentences": 2,
-            "max_chars_per_sentence": 300,
+            # Soft cap: do NOT truncate sentences; allow exceeding this to keep full sentences.
+            "max_chars_per_sentence_soft": 300,
+
+            # PR4 clustering configuration (pluggable methods + hyperparameters)
+            "clustering": {
+                "vectorizer": "tfidf",  # tfidf | embeddings | custom
+                "similarity": "cosine",  # cosine | dot | jaccard | custom
+                "algorithm": "kmeans",  # kmeans | agglomerative | dbscan
+                "random_state": 42,
+                # Vectorizer params (tfidf example)
+                "tfidf": {"ngram_range": (1, 1), "min_df": 1, "max_df": 1.0, "max_features": None},
+                # Embeddings params (if used)
+                "embeddings": {"model": None, "normalize": True},
+                # Clustering params (examples)
+                "kmeans": {"n_clusters": 20, "n_init": 10, "max_iter": 300},
+                "agglomerative": {"n_clusters": None, "distance_threshold": 0.7, "linkage": "average"},
+                "dbscan": {"eps": 0.5, "min_samples": 5},
+            },
 
             # Feature selection / extensibility (PR5): list of enabled feature names.
             "enabled_features": [],

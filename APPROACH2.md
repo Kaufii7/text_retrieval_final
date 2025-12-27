@@ -44,7 +44,10 @@ Design principles:
     `q-a-rag-assignment-3-reichman-uni/rag_system/passages.py`:
     - sentence split via regex: `re.split(r"(?<=[.!?])\\s+", text)`
     - strip empty sentences
-    - cap sentence length with `max_chars_per_sentence` (truncate and add `...`)
+    - do **not** truncate sentences. Instead:
+      - define a **soft cap** `max_chars_per_sentence_soft`
+      - if a sentence exceeds the soft cap, **keep the full sentence** (we assume sentences are not extremely long)
+      - passages must always end on a **full sentence boundary**
     - build overlapping windows using:
       - `min_sentences`
       - `max_sentences`
@@ -76,15 +79,27 @@ Design principles:
 
 - **Goal**: cluster passages into topical groups per query (or per doc → then merged).
 - **Changes**
-  - Choose similarity + clustering:
-    - TF-IDF cosine + agglomerative / k-means, OR
-    - embeddings + k-means / HDBSCAN (if allowed)
+  - Make similarity/scoring **pluggable & configurable** so you can tune methods + hyperparameters:
+    - **Vectorization** (config-selected): `tfidf` | `bm25`-style | `embeddings` (if allowed)
+    - **Similarity** (config-selected): `cosine` | `dot` | `jaccard` | custom
+    - **Clustering** (config-selected): `kmeans` | `agglomerative` | `dbscan/hdbscan` (if allowed)
+    - Expose key hyperparameters in config (examples):
+      - TF-IDF: `ngram_range`, `min_df`, `max_df`, `max_features`, normalization
+      - Embeddings: model name, pooling, normalization
+      - KMeans: `n_clusters`, `random_state`, `n_init`, `max_iter`
+      - Agglomerative: `linkage`, `distance_threshold`, `n_clusters`
+      - DBSCAN: `eps`, `min_samples`
+  - Implementation structure:
+    - `similarity.py`: `vectorize(passages, cfg)`, `similarity_matrix(vectors, cfg)`
+    - `cluster.py`: `cluster_passages(sim_matrix_or_vectors, cfg) -> cluster_ids`
+    - Keep stable seeding and deterministic ordering.
   - Define cluster container:
     - cluster_id → list of passages (or passage ids)
   - Add parameters: `n_clusters` or threshold, distance metric, random seed.
 - **Acceptance**
   - Clustering produces stable cluster assignments given fixed seed.
   - Each passage belongs to exactly one cluster.
+  - You can swap similarity/clustering methods by config-only changes (no code edits).
 
 ---
 
