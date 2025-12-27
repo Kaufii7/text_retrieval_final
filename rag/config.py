@@ -41,8 +41,11 @@ def default_approach2_config() -> ApproachConfig:
             "clustering": {
                 "vectorizer": "tfidf",  # tfidf | embeddings | custom
                 "similarity": "cosine",  # cosine | dot | jaccard | custom
-                "algorithm": "kmeans",  # kmeans | agglomerative | dbscan
+                # Default is dependency-free:
+                "algorithm": "graph_threshold",  # graph_threshold | kmeans | agglomerative | dbscan
                 "random_state": 42,
+                # Used by graph_threshold:
+                "threshold": 0.5,
                 # Vectorizer params (tfidf example)
                 "tfidf": {"ngram_range": (1, 1), "min_df": 1, "max_df": 1.0, "max_features": None},
                 # Embeddings params (if used)
