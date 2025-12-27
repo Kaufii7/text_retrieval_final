@@ -65,10 +65,9 @@ Design principles:
 
 - **Goal**: assign **query-dependent scores/ranks** to passages so we can build clustering features later.
 - **Changes**
-  - Use a `LuceneSearcher` over a **passage index** and support:
-    - **BM25**, and
-    - **QLD with `mu=1000`**
-  - Create/maintain a passage index (one-time build) from extracted passages so passage retrieval is efficient.
+  - Rank extracted passages **in-memory** (no Lucene index) and support:
+    - **BM25** (computed over the candidate passage set), and
+    - **QLD with `mu=1000`** (Dirichlet smoothing; background model from candidate set)
   - Produce per-query ranked passage list and (optionally) per-doc passage ranks.
 - **Acceptance**
   - For a query, you can list top passages with stable ranks/scores.
