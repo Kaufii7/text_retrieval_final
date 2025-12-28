@@ -80,22 +80,33 @@ def default_approach2_config() -> ApproachConfig:
             },
 
             # PR8 pipeline limits (runtime control during development)
-            "doc_content_topk": 100,
+            "doc_content_topk": 2000,
             "clustering_max_passages": 200,
+            # Candidate generation depth for clustpsg (retrieve this many docs, then rerank, then output topk=1000).
+            "doc_candidates_depth": 2000,
 
             # Training-time: include *all* judged qrels docids as candidates, even if retrieval is top-k capped.
             "train_include_all_qrels_docs": True,
             # When split=train, how many candidate docs to fetch full content for passage extraction.
             # If None, uses doc_content_topk.
             "train_doc_content_topk": None,
+            # Training doc source:
+            # - "qrels": build training set from qrels docids only (fetched by docid)
+            # - "retrieved": train from retrieved candidates (optionally augmented with qrels docids)
+            "train_docs_source": "qrels",
 
             # PR8 reranking control: keep clustpsg from wrecking a strong baseline.
             # - Only rerank within the top-N retrieved documents.
             # - Blend SVM score with baseline retrieval score.
             "rerank": {
-                "topn": 200,
+                "topn": 1000,
                 # final = alpha * svm + (1-alpha) * baseline
-                "alpha": 0.2,
+                "alpha": 0.8,
+                # Optional normalization of per-query SVM decision scores before blending:
+                # none | zscore | minmax
+                "svm_norm": "zscore",
+                # Additional multiplier applied to the (optionally normalized) SVM score.
+                "svm_scale": 1.0,
             },
         },
         candidates_depth=None,
