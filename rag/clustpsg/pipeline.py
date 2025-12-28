@@ -24,6 +24,7 @@ from rag.clustpsg.cluster import cluster_passages
 from rag.clustpsg.dataset import build_cluster_level_training_set
 from rag.clustpsg.doc_retrieval import retrieve_doc_candidates
 from rag.clustpsg.model import load_model, save_model, score_documents, train_model_from_config
+from rag.clustpsg.passage_cache import load_ranked_passages, save_ranked_passages
 from rag.clustpsg.passage_extraction import passages_by_topic
 from rag.clustpsg.passage_retrieval import rank_passages
 from rag.io import load_qrels
@@ -139,6 +140,7 @@ def clustpsg_run(
     split: str,
     qrels_path: str = "qrels_50_Queries",
     train_model: bool = False,
+    precompute_only: bool = False,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[int, List[Tuple[str, float]]]:
     """Run clustpsg and return per-topic reranked documents.
@@ -149,6 +151,10 @@ def clustpsg_run(
     log = logger or logging.getLogger("rag.clustpsg.pipeline")
     cfg = config or default_approach2_config()
     params = cfg.params or {}
+
+    cache_cfg = (params.get("passage_cache") or {})
+    cache_enabled = bool(cache_cfg.get("enabled", False))
+    cache_dir = str(cache_cfg.get("dir", "cache/ranked_passages"))
 
     # Limits to keep runtime sane during development.
     doc_content_topk = int(params.get("doc_content_topk", 100))
@@ -168,15 +174,44 @@ def clustpsg_run(
 
     # --- Training set construction (can be different from inference candidates) ---
     train_docs_by_topic: Dict[int, List[Document]] = {}
+    train_ranked_passages_by_topic: Dict[int, List] | None = None
     if split == "train":
         if train_docs_source == "qrels":
-            # Use judged documents only (both relevant and non-relevant), fetched by docid.
+            # Use judged documents only (both relevant and non-relevant).
+            # If passage cache is enabled and available, we can skip fetching contents entirely.
+            train_docids_by_topic: Dict[int, List[str]] = {}
             for topic_id in sorted(qrels.keys()):
-                train_docs_by_topic[topic_id] = _docs_from_qrels(
-                    searcher=searcher,
-                    qrels_topic=qrels.get(topic_id, {}),
-                    topk=train_doc_content_topk,
+                docids = sorted((qrels.get(topic_id, {}) or {}).keys())
+                if train_doc_content_topk is not None:
+                    docids = docids[: int(train_doc_content_topk)]
+                train_docids_by_topic[topic_id] = docids
+
+            if cache_enabled:
+                cached = load_ranked_passages(
+                    cache_dir=cache_dir,
+                    stage="train",
+                    queries=queries,
+                    docids_by_topic=train_docids_by_topic,
+                    topk=clustering_max_passages,
+                    cfg=cfg,
                 )
+                if cached is not None:
+                    train_ranked_passages_by_topic = cached
+                    # Keep doc list for doc-rank features; contents aren't needed if passages are cached.
+                    for topic_id, docids in train_docids_by_topic.items():
+                        train_docs_by_topic[topic_id] = [Document(id=d, content="", score=None) for d in docids]
+                    log.info("Loaded cached ranked passages (stage=train) from %s", cache_dir)
+                else:
+                    log.info("No cached ranked passages found (stage=train); computing and caching to %s", cache_dir)
+
+            if train_ranked_passages_by_topic is None:
+                # Cache miss or caching disabled -> fetch doc contents and compute passages.
+                for topic_id in sorted(qrels.keys()):
+                    train_docs_by_topic[topic_id] = _docs_from_qrels(
+                        searcher=searcher,
+                        qrels_topic=qrels.get(topic_id, {}),
+                        topk=train_doc_content_topk,
+                    )
         elif train_docs_source == "retrieved":
             # Train from retrieved candidates (optionally augmented with qrels docids).
             train_docs_by_topic = retrieve_doc_candidates(
@@ -184,13 +219,29 @@ def clustpsg_run(
             )
             if train_include_all_qrels_docs:
                 train_docs_by_topic = augment_candidates_with_qrels(candidates_by_topic=train_docs_by_topic, qrels=qrels)
-            # Fetch contents for the capped subset
-            for topic_id in sorted(train_docs_by_topic.keys()):
-                train_docs_by_topic[topic_id] = _with_contents(
-                    searcher=searcher,
-                    docs=train_docs_by_topic[topic_id],
-                    topk=train_doc_content_topk,
+            # If passages are cached, skip content fetch; otherwise fetch contents for capped subset.
+            train_docids_by_topic = {tid: [d.id for d in train_docs_by_topic.get(tid, [])[: int(train_doc_content_topk)]] for tid in sorted(train_docs_by_topic.keys())}
+            if cache_enabled:
+                cached = load_ranked_passages(
+                    cache_dir=cache_dir,
+                    stage="train",
+                    queries=queries,
+                    docids_by_topic=train_docids_by_topic,
+                    topk=clustering_max_passages,
+                    cfg=cfg,
                 )
+                if cached is not None:
+                    train_ranked_passages_by_topic = cached
+                    log.info("Loaded cached ranked passages (stage=train) from %s", cache_dir)
+                else:
+                    log.info("No cached ranked passages found (stage=train); computing and caching to %s", cache_dir)
+            if train_ranked_passages_by_topic is None:
+                for topic_id in sorted(train_docs_by_topic.keys()):
+                    train_docs_by_topic[topic_id] = _with_contents(
+                        searcher=searcher,
+                        docs=train_docs_by_topic[topic_id],
+                        topk=train_doc_content_topk,
+                    )
         else:
             raise ValueError(f"Unknown train_docs_source: {train_docs_source!r} (use 'qrels' or 'retrieved')")
 
@@ -199,20 +250,81 @@ def clustpsg_run(
         queries=queries, searcher=searcher, topk=doc_candidates_depth, config=cfg, logger=log
     )
 
-    # 2) Fetch doc contents for passage extraction (cap by doc_content_topk)
-    docs_with_content_by_topic: Dict[int, List[Document]] = {}
-    for topic_id in sorted(doc_candidates_by_topic.keys()):
-        docs = doc_candidates_by_topic[topic_id]
-        cap = train_doc_content_topk if split == "train" else doc_content_topk
-        docs_with_content_by_topic[topic_id] = _with_contents(searcher=searcher, docs=docs, topk=cap)
+    # 2-4) Fetch contents -> extract passages -> rank passages (with optional cache)
+    cap = train_doc_content_topk if split == "train" else doc_content_topk
+    infer_docids_by_topic: Dict[int, List[str]] = {
+        tid: [d.id for d in (doc_candidates_by_topic.get(tid, [])[: int(cap)])]
+        for tid in sorted(doc_candidates_by_topic.keys())
+    }
+    ranked_passages_by_topic = None
+    if cache_enabled:
+        ranked_passages_by_topic = load_ranked_passages(
+            cache_dir=cache_dir,
+            stage="inference",
+            queries=queries,
+            docids_by_topic=infer_docids_by_topic,
+            topk=clustering_max_passages,
+            cfg=cfg,
+        )
+        if ranked_passages_by_topic is not None:
+            log.info("Loaded cached ranked passages (stage=inference) from %s", cache_dir)
+        else:
+            log.info("No cached ranked passages found (stage=inference); computing and caching to %s", cache_dir)
 
-    # 3) Extract passages
-    extracted_passages_by_topic = passages_by_topic(docs_with_content_by_topic, cfg=cfg)
+    if ranked_passages_by_topic is None:
+        docs_with_content_by_topic: Dict[int, List[Document]] = {}
+        for topic_id in sorted(doc_candidates_by_topic.keys()):
+            docs = doc_candidates_by_topic[topic_id]
+            docs_with_content_by_topic[topic_id] = _with_contents(searcher=searcher, docs=docs, topk=int(cap))
 
-    # 4) Rank passages locally (BM25/QLD over candidate set)
-    ranked_passages_by_topic = rank_passages(
-        queries=queries, passages_by_topic=extracted_passages_by_topic, topk=clustering_max_passages, config=cfg, logger=log
-    )
+        extracted_passages_by_topic = passages_by_topic(docs_with_content_by_topic, cfg=cfg)
+
+        ranked_passages_by_topic = rank_passages(
+            queries=queries,
+            passages_by_topic=extracted_passages_by_topic,
+            topk=clustering_max_passages,
+            config=cfg,
+            logger=log,
+            stage="inference",
+        )
+        if cache_enabled:
+            save_ranked_passages(
+                cache_dir=cache_dir,
+                stage="inference",
+                queries=queries,
+                docids_by_topic=infer_docids_by_topic,
+                topk=clustering_max_passages,
+                cfg=cfg,
+                ranked_passages_by_topic=ranked_passages_by_topic,
+            )
+
+    # If we're only precomputing caches, stop here (no need for clustering/SVM).
+    if precompute_only:
+        if split == "train":
+            # Ensure train cache is also populated
+            if train_ranked_passages_by_topic is None:
+                train_passages = passages_by_topic(train_docs_by_topic, cfg=cfg)
+                train_ranked_passages = rank_passages(
+                    queries=queries,
+                    passages_by_topic=train_passages,
+                    topk=clustering_max_passages,
+                    config=cfg,
+                    logger=log,
+                    stage="train",
+                )
+                # docids used for extraction for train
+                train_docids_for_cache = {tid: [d.id for d in train_docs_by_topic.get(tid, [])] for tid in sorted(train_docs_by_topic.keys())}
+                if cache_enabled:
+                    save_ranked_passages(
+                        cache_dir=cache_dir,
+                        stage="train",
+                        queries=queries,
+                        docids_by_topic=train_docids_for_cache,
+                        topk=clustering_max_passages,
+                        cfg=cfg,
+                        ranked_passages_by_topic=train_ranked_passages,
+                    )
+        return {}
 
     # 5) Cluster passages per topic (over the ranked list)
     clustering_cfg = params.get("clustering", {}) or {}
@@ -227,24 +339,38 @@ def clustpsg_run(
     train_instances: List = []
     feature_names: List[str] = []
     if split == "train":
-        # Build a training pipeline over the training docs
-        train_passages = passages_by_topic(train_docs_by_topic, cfg=cfg)
-        train_ranked_passages = rank_passages(
-            queries=queries,
-            passages_by_topic=train_passages,
-            topk=clustering_max_passages,
-            config=cfg,
-            logger=log,
-        )
+        # Build a training pipeline over the training docs (can be cached)
+        if train_ranked_passages_by_topic is None:
+            train_passages = passages_by_topic(train_docs_by_topic, cfg=cfg)
+            train_ranked_passages = rank_passages(
+                queries=queries,
+                passages_by_topic=train_passages,
+                topk=clustering_max_passages,
+                config=cfg,
+                logger=log,
+                stage="train",
+            )
+            train_ranked_passages_by_topic = train_ranked_passages
+            if cache_enabled:
+                train_docids_for_cache = {tid: [d.id for d in train_docs_by_topic.get(tid, [])] for tid in sorted(train_docs_by_topic.keys())}
+                save_ranked_passages(
+                    cache_dir=cache_dir,
+                    stage="train",
+                    queries=queries,
+                    docids_by_topic=train_docids_for_cache,
+                    topk=clustering_max_passages,
+                    cfg=cfg,
+                    ranked_passages_by_topic=train_ranked_passages_by_topic,
+                )
         train_clusters_by_topic = {}
         for q in queries:
-            plist = train_ranked_passages.get(q.id, [])
+            plist = train_ranked_passages_by_topic.get(q.id, [])
             train_clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
         train_instances, feature_names = build_cluster_level_training_set(
             queries=queries,
             qrels=qrels,
             doc_candidates_by_topic=train_docs_by_topic,
-            ranked_passages_by_topic=train_ranked_passages,
+            ranked_passages_by_topic=train_ranked_passages_by_topic,
             clusters_by_topic=train_clusters_by_topic,
             config=cfg,
         )

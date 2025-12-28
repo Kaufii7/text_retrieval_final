@@ -9,6 +9,7 @@ This PR ranks *extracted passages* in-memory (no Lucene index):
 from __future__ import annotations
 
 import logging
+import time
 from typing import Dict, List, Optional, Sequence
 
 from rag.config import ApproachConfig
@@ -31,6 +32,7 @@ def rank_passages(
     topk: int,
     config: ApproachConfig,
     logger: Optional[logging.Logger] = None,
+    stage: str | None = None,
 ) -> Dict[int, List[Passage]]:
     """Rank passages per query using local BM25/QLD scoring.
 
@@ -40,16 +42,19 @@ def rank_passages(
     if topk <= 0:
         raise ValueError("topk must be > 0")
     log = logger or logging.getLogger("rag.clustpsg.passage_retrieval")
+    t0 = time.perf_counter()
 
     model_cfg = (config.params or {}).get("passage_retrieval", {}) if config else {}
     model = (model_cfg.get("model") or "bm25").lower()
 
     results_by_topic: Dict[int, List[Passage]] = {}
+    total_passages = 0
     for q in queries:
         passages = passages_by_topic.get(q.id, [])
         if not passages:
             results_by_topic[q.id] = []
             continue
+        total_passages += len(passages)
 
         q_terms = tokenize(q.content)
         docs_tokens = [tokenize(p.content) for p in passages]
@@ -103,7 +108,17 @@ def rank_passages(
         scored.sort(key=lambda x: (-x[0], x[1].document_id, x[1].index))
         results_by_topic[q.id] = [p for _s, p in scored[:topk]]
 
-    log.info("Ranked passages locally for %d queries (topk=%d, model=%s).", len(queries), topk, model)
+    dt = time.perf_counter() - t0
+    stage_str = f", stage={stage}" if stage else ""
+    log.info(
+        "Ranked passages locally for %d queries (topk=%d, model=%s, passages=%d%s) in %.2fs.",
+        len(queries),
+        topk,
+        model,
+        total_passages,
+        stage_str,
+        dt,
+    )
     return results_by_topic
 
 

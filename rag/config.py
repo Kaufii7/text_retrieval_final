@@ -89,6 +89,13 @@ def default_approach2_config() -> ApproachConfig:
             # RRF parameters for converting passage ranking -> document scores
             "rrf": {"k": 60, "depth": 200},
 
+            # Cache ranked passages to speed up iterative runs (especially when only tuning downstream params).
+            # Cache key includes: queries + docids used + extraction params + passage_retrieval params + topk.
+            "passage_cache": {
+                "enabled": True,
+                "dir": "cache/ranked_passages",
+            },
+
             # PR7 SVM hyperparameters / persistence
             "svm": {
                 # Backend: "svm_rank" (Joachims SVM^rank) or "linear_svc" (sklearn baseline)
@@ -110,7 +117,7 @@ def default_approach2_config() -> ApproachConfig:
             },
 
             # PR8 pipeline limits (runtime control during development)
-            "doc_content_topk": 2000,
+            "doc_content_topk": 1000,
             "clustering_max_passages": 200,
             # Candidate generation depth for clustpsg (retrieve this many docs, then rerank, then output topk=1000).
             "doc_candidates_depth": 2000,

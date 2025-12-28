@@ -48,6 +48,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # clustpsg (Approach 2) training control
     p.add_argument("--train-model", action="store_true", help="If --approach clustpsg and split=train, train and save the SVM model.")
+    p.add_argument(
+        "--precompute-passages",
+        action="store_true",
+        help="If --approach clustpsg, precompute and cache ranked passages (train/inference stages) and exit (no model needed).",
+    )
     return p
 
 
@@ -78,8 +83,12 @@ def main() -> int:
             split=args.split,
             qrels_path=args.qrels,
             train_model=args.train_model,
+            precompute_only=bool(args.precompute_passages),
             logger=log,
         )
+        if args.precompute_passages:
+            log.info("Precomputed ranked passages cache. Exiting as requested by --precompute-passages.")
+            return 0
         results_by_topic = {tid: [{"docid": docid, "score": score} for docid, score in pairs] for tid, pairs in run.items()}
     else:
         raise ValueError("Unknown approach: {0}".format(args.approach))
