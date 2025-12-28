@@ -47,6 +47,8 @@ def default_approach2_config() -> ApproachConfig:
                 "random_state": 42,
                 # Used by graph_threshold:
                 "threshold": 0.5,
+                # Max number of passages in a single centered cluster (including the center passage).
+                "max_cluster_size": 20,
                 # Vectorizer params (tfidf example)
                 "tfidf": {"ngram_range": (1, 1), "min_df": 1, "max_df": 1.0, "max_features": None},
                 # Embeddings params (if used)

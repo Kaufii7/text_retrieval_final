@@ -1,7 +1,8 @@
 """PR4: Clustering passages (pluggable & configurable).
 
 This module provides a dependency-free default clustering method:
-- graph-threshold clustering: build similarity edges above a threshold and take connected components.
+- graph-threshold clustering (centered): for every passage, create its own cluster
+  centered at that passage containing its most similar neighbors above threshold.
 
 It also leaves room for sklearn-based methods (kmeans/agglomerative/dbscan) later.
 """
@@ -13,7 +14,7 @@ from typing import Dict, List, Mapping, Sequence
 
 from rag.types import Passage
 
-from rag.clustpsg.similarity import similarity_edges, vectorize_passages
+from rag.clustpsg.similarity import pair_similarity, vectorize_passages
 
 
 @dataclass(frozen=True)
@@ -42,39 +43,37 @@ def cluster_passages(passages: Sequence[Passage], *, cfg: Mapping[str, object]) 
 
 
 def _cluster_graph_threshold(passages: Sequence[Passage], cfg: Mapping[str, object]) -> List[Cluster]:
+    """Centered threshold clustering.
+
+    For every passage i, we create a cluster:
+      {i} ∪ top neighbors j with sim(i,j) >= threshold
+    capped to max_cluster_size.
+
+    Note: clusters may overlap (this is intended).
+    """
     vectors = vectorize_passages(passages, cfg)
-    edges = similarity_edges(vectors, cfg)
+    similarity = str(cfg.get("similarity", "cosine")).lower()
+    threshold = float(cfg.get("threshold", 0.5))
+    max_cluster_size = int(cfg.get("max_cluster_size", 20))
+    if max_cluster_size <= 0:
+        raise ValueError("max_cluster_size must be > 0")
 
     n = len(passages)
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int) -> None:
-        ra, rb = find(a), find(b)
-        if ra == rb:
-            return
-        # deterministic union: attach larger root id to smaller
-        if ra < rb:
-            parent[rb] = ra
-        else:
-            parent[ra] = rb
-
-    for i, j, _s in edges:
-        union(i, j)
-
-    groups: Dict[int, List[int]] = {}
-    for i in range(n):
-        r = find(i)
-        groups.setdefault(r, []).append(i)
-
     clusters: List[Cluster] = []
-    for cid, root in enumerate(sorted(groups.keys())):
-        clusters.append(Cluster(id=cid, passage_indices=groups[root]))
+
+    for i in range(n):
+        sims: List[tuple[float, int]] = []
+        for j in range(n):
+            if i == j:
+                continue
+            s = pair_similarity(vectors[i], vectors[j], similarity=similarity)
+            if s >= threshold:
+                sims.append((float(s), j))
+
+        # Deterministic: sort by similarity desc then index asc.
+        sims.sort(key=lambda x: (-x[0], x[1]))
+        members = [i] + [j for _s, j in sims[: max(0, max_cluster_size - 1)]]
+        clusters.append(Cluster(id=i, passage_indices=members))
 
     return clusters
 
