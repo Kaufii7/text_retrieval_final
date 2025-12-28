@@ -51,6 +51,10 @@ def vectorize_passages(passages: Sequence[Passage], clustering_cfg: Mapping[str,
             max_features=max_features,
         )
 
+    if vectorizer in ("lm", "unigram_lm", "unigram"):
+        # Unigram language model: dict[token] -> probability (sums to 1).
+        return _unigram_lm_vectors(passages)
+
     if vectorizer in ("jaccard", "token_set"):
         return [set(_tokenize(p.content)) for p in passages]
 
@@ -95,6 +99,8 @@ def pair_similarity(a: object, b: object, *, similarity: str) -> float:
         return _dot(a, b)
     if similarity == "jaccard":
         return _jaccard(a, b)
+    if similarity in ("kl", "kl_divergence", "kld"):
+        return _kl_similarity(a, b)
     raise ValueError(f"Unknown similarity: {similarity!r}")
 
 
@@ -126,6 +132,63 @@ def _jaccard(a: object, b: object) -> float:
         union = len(a | b)
         return float(inter / union) if union else 0.0
     raise TypeError("jaccard similarity is only implemented for set vectors")
+
+
+def _kl_similarity(a: object, b: object) -> float:
+    """Symmetric KL divergence transformed into a similarity.
+
+    Expects unigram LM vectors: dict[token] -> probability (approximately sums to 1).
+    Uses epsilon smoothing on missing tokens, then returns:
+      sim = exp(-0.5*(KL(P||Q) + KL(Q||P)))
+    """
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        raise TypeError("KL similarity is only implemented for dict LM vectors")
+
+    eps = 1e-9
+    keys = set(a.keys()) | set(b.keys())
+    if not keys:
+        return 0.0
+
+    # Smooth + renormalize
+    sum_a = 0.0
+    sum_b = 0.0
+    pa: Dict[str, float] = {}
+    pb: Dict[str, float] = {}
+    for k in keys:
+        va = float(a.get(k, 0.0)) + eps
+        vb = float(b.get(k, 0.0)) + eps
+        pa[k] = va
+        pb[k] = vb
+        sum_a += va
+        sum_b += vb
+    for k in keys:
+        pa[k] /= sum_a
+        pb[k] /= sum_b
+
+    kl_ab = 0.0
+    kl_ba = 0.0
+    for k in keys:
+        p = pa[k]
+        q = pb[k]
+        kl_ab += p * math.log(p / q)
+        kl_ba += q * math.log(q / p)
+
+    sym = 0.5 * (kl_ab + kl_ba)
+    return float(math.exp(-sym))
+
+
+def _unigram_lm_vectors(passages: Sequence[Passage]) -> List[SparseVec]:
+    """Compute unigram LM probability vectors (dependency-free)."""
+    vecs: List[SparseVec] = []
+    for p in passages:
+        toks = _tokenize(p.content)
+        if not toks:
+            vecs.append({})
+            continue
+        c = Counter(toks)
+        total = float(len(toks))
+        vecs.append({t: cnt / total for t, cnt in c.items()})
+    return vecs
 
 
 def _tfidf_vectors(

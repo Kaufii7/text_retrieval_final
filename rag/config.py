@@ -39,8 +39,9 @@ def default_approach2_config() -> ApproachConfig:
 
             # PR4 clustering configuration (pluggable methods + hyperparameters)
             "clustering": {
-                "vectorizer": "tfidf",  # tfidf | embeddings | custom
-                "similarity": "cosine",  # cosine | dot | jaccard | custom
+                # For graph_threshold, we default to KL-based similarity over unigram LMs:
+                "vectorizer": "lm",  # lm | tfidf | jaccard | embeddings | custom
+                "similarity": "kl",  # kl | cosine | dot | jaccard | custom
                 # Default is dependency-free:
                 "algorithm": "graph_threshold",  # graph_threshold | kmeans | agglomerative | dbscan
                 "random_state": 42,
