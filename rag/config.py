@@ -75,11 +75,22 @@ def default_approach2_config() -> ApproachConfig:
 
             # PR7 SVM hyperparameters / persistence
             "svm": {
+                # Backend: "svm_rank" (Joachims SVM^rank) or "linear_svc" (sklearn baseline)
+                "backend": "svm_rank",
                 "C": 1.0,
                 "class_weight": "balanced",  # "balanced" | None
                 "max_iter": 5000,
                 "random_state": 42,
+                # Metadata pickle (used by both backends)
                 "model_path": "models/clustpsg_svm.pkl",
+
+                # SVM^rank binaries + paths (must be installed on your machine and in PATH, or provide absolute paths)
+                "svm_rank_learn_bin": "svm_rank_learn",
+                "svm_rank_classify_bin": "svm_rank_classify",
+                # Where to write svmrank train/test files and predictions
+                "svm_rank_work_dir": "models/svmrank_work",
+                # Where svm_rank_learn writes the external model file
+                "svm_rank_model_path": "models/svmrank.model",
             },
 
             # PR8 pipeline limits (runtime control during development)

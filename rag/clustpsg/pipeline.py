@@ -22,7 +22,7 @@ from rag.config import ApproachConfig, default_approach2_config
 from rag.clustpsg.cluster import cluster_passages
 from rag.clustpsg.dataset import build_doc_level_training_set
 from rag.clustpsg.doc_retrieval import retrieve_doc_candidates
-from rag.clustpsg.model import load_model, save_model, score_documents, train_linear_svm
+from rag.clustpsg.model import load_model, save_model, score_documents, train_model_from_config
 from rag.clustpsg.passage_extraction import passages_by_topic
 from rag.clustpsg.passage_retrieval import rank_passages
 from rag.io import load_qrels
@@ -230,16 +230,9 @@ def clustpsg_run(
     svm_cfg = (params.get("svm") or {})
     model_path = str(svm_cfg.get("model_path", "models/clustpsg_svm.pkl"))
     if split == "train" and train_model:
-        m = train_linear_svm(
-            instances=train_instances,
-            feature_names=feature_names,
-            C=float(svm_cfg.get("C", 1.0)),
-            class_weight=svm_cfg.get("class_weight", "balanced"),
-            max_iter=int(svm_cfg.get("max_iter", 5000)),
-            random_state=int(svm_cfg.get("random_state", 42)),
-        )
+        m = train_model_from_config(instances=train_instances, feature_names=feature_names, svm_cfg=svm_cfg)
         save_model(m, model_path)
-        log.info("Saved clustpsg SVM model to %s", model_path)
+        log.info("Saved clustpsg model metadata to %s (backend=%s)", model_path, m.model_type)
     m = load_model(model_path)
 
     # 8) Score docs and produce reranked run

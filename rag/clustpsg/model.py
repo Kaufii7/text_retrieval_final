@@ -1,7 +1,8 @@
-"""PR7: Learning-to-rank model for clustpsg (SVM).
+"""Learning-to-rank model backends for clustpsg.
 
-This module trains a (linear) SVM on the doc-level training instances produced
-by `rag.clustpsg.dataset`.
+Supports:
+- LinearSVC (pointwise classifier baseline)
+- SVM^rank (Joachims) via external binaries (recommended for ranking)
 
 Design goals:
 - deterministic and reproducible (fixed random_state where relevant)
@@ -13,9 +14,15 @@ from __future__ import annotations
 
 import pickle
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, List, Mapping, Sequence, Tuple
 
 from rag.clustpsg.dataset import LTRInstance
+from rag.clustpsg.svm_rank import (
+    read_predictions,
+    run_svmrank_classify,
+    run_svmrank_learn,
+    write_svmrank_file,
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +84,35 @@ def train_linear_svm(
     return TrainedModel(feature_names=list(feature_names), model_type="LinearSVC", model=clf)
 
 
+def train_svm_rank(
+    *,
+    instances: Sequence[LTRInstance],
+    feature_names: Sequence[str],
+    learn_bin: str,
+    classify_bin: str,
+    C: float,
+    work_dir: str,
+    external_model_path: str,
+) -> TrainedModel:
+    """Train SVM^rank and return a TrainedModel that references the external model file."""
+    import os
+
+    os.makedirs(work_dir, exist_ok=True)
+    train_path = os.path.join(work_dir, "svmrank_train.dat")
+    write_svmrank_file(instances=instances, feature_names=feature_names, output_path=train_path, include_labels=True)
+
+    run_svmrank_learn(learn_bin=learn_bin, train_path=train_path, model_out_path=external_model_path, C=C)
+
+    meta = {
+        "backend": "svm_rank",
+        "learn_bin": learn_bin,
+        "classify_bin": classify_bin,
+        "external_model_path": external_model_path,
+        "work_dir": work_dir,
+    }
+    return TrainedModel(feature_names=list(feature_names), model_type="SVMrank", model=meta)
+
+
 def save_model(m: TrainedModel, path: str) -> None:
     with open(path, "wb") as f:
         pickle.dump(m, f)
@@ -100,18 +136,77 @@ def score_documents(
     Returns:
       dict[(topic_id, docid)] -> score (higher is better)
     """
-    X, _y = vectorize_instances(instances, model.feature_names)
-    clf = model.model
-
-    if hasattr(clf, "decision_function"):
+    if model.model_type == "LinearSVC":
+        X, _y = vectorize_instances(instances, model.feature_names)
+        clf = model.model
+        if not hasattr(clf, "decision_function"):
+            raise TypeError("LinearSVC pipeline does not expose decision_function for scoring.")
         scores = clf.decision_function(X)
-    else:
-        raise TypeError("Model does not expose decision_function for scoring.")
+        out: Dict[Tuple[int, str], float] = {}
+        for ins, s in zip(instances, scores):
+            out[(ins.topic_id, ins.docid)] = float(s)
+        return out
 
-    # scores is array-like
-    out: Dict[Tuple[int, str], float] = {}
-    for ins, s in zip(instances, scores):
-        out[(ins.topic_id, ins.docid)] = float(s)
-    return out
+    if model.model_type == "SVMrank":
+        import os
+
+        meta = model.model
+        if not isinstance(meta, dict):
+            raise TypeError("SVMrank model metadata is invalid.")
+        classify_bin = str(meta["classify_bin"])
+        external_model_path = str(meta["external_model_path"])
+        work_dir = str(meta["work_dir"])
+        test_path = os.path.join(work_dir, "svmrank_test.dat")
+        pred_path = os.path.join(work_dir, "svmrank_pred.txt")
+        write_svmrank_file(instances=instances, feature_names=model.feature_names, output_path=test_path, include_labels=False)
+        run_svmrank_classify(
+            classify_bin=classify_bin,
+            test_path=test_path,
+            model_path=external_model_path,
+            predictions_out_path=pred_path,
+        )
+        preds = read_predictions(pred_path)
+        if len(preds) != len(instances):
+            raise RuntimeError(f"SVMrank predictions length mismatch: {len(preds)} != {len(instances)}")
+        out: Dict[Tuple[int, str], float] = {}
+        for ins, s in zip(instances, preds):
+            out[(ins.topic_id, ins.docid)] = float(s)
+        return out
+
+    raise ValueError(f"Unknown model_type: {model.model_type!r}")
+
+
+def train_model_from_config(
+    *,
+    instances: Sequence[LTRInstance],
+    feature_names: Sequence[str],
+    svm_cfg: Mapping[str, object],
+) -> TrainedModel:
+    """Train the configured backend."""
+    backend = str(svm_cfg.get("backend", "svm_rank")).lower()
+    if backend in ("linear_svc", "linearsvc", "linear"):
+        return train_linear_svm(
+            instances=instances,
+            feature_names=feature_names,
+            C=float(svm_cfg.get("C", 1.0)),
+            class_weight=svm_cfg.get("class_weight", "balanced"),
+            max_iter=int(svm_cfg.get("max_iter", 5000)),
+            random_state=int(svm_cfg.get("random_state", 42)),
+        )
+    if backend in ("svm_rank", "svmrank"):
+        learn_bin = str(svm_cfg.get("svm_rank_learn_bin", "svm_rank_learn"))
+        classify_bin = str(svm_cfg.get("svm_rank_classify_bin", "svm_rank_classify"))
+        work_dir = str(svm_cfg.get("svm_rank_work_dir", "models/svmrank_work"))
+        external_model_path = str(svm_cfg.get("svm_rank_model_path", "models/svmrank.model"))
+        return train_svm_rank(
+            instances=instances,
+            feature_names=feature_names,
+            learn_bin=learn_bin,
+            classify_bin=classify_bin,
+            C=float(svm_cfg.get("C", 1.0)),
+            work_dir=work_dir,
+            external_model_path=external_model_path,
+        )
+    raise ValueError(f"Unknown SVM backend: {backend!r}")
 
 
