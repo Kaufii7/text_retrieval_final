@@ -175,6 +175,87 @@ def build_doc_level_training_set(
     return instances, feature_names
 
 
+def build_cluster_level_training_set(
+    *,
+    queries: Sequence[Query],
+    qrels: Mapping[int, Mapping[str, int]],
+    doc_candidates_by_topic: Mapping[int, Sequence[Document]],
+    ranked_passages_by_topic: Mapping[int, Sequence[Passage]],
+    clusters_by_topic: Mapping[int, Sequence[Cluster]],
+    config: ApproachConfig,
+) -> Tuple[List[LTRInstance], List[str]]:
+    """Build *cluster*-level training instances.
+
+    This supports the intended ClustPsg pipeline:
+      docs -> passages -> clusters -> SVM (rank clusters) -> propagate to passages -> RRF -> docs
+
+    Labels:
+      cluster label = 1 iff the cluster contains at least one passage whose source document
+      is relevant in qrels for this topic (rel >= label_rel_threshold).
+
+    Notes:
+    - We keep using `LTRInstance` for compatibility with existing SVM tooling. Here, `docid`
+      is a stable cluster identifier string (e.g., "cl_17").
+    """
+    params = config.params or {}
+    enabled = params.get("enabled_features", [])
+    label_rel_threshold = int(params.get("label_rel_threshold", 1))
+    max_pairwise = int(params.get("feature_max_pairwise_sim", 2000))
+    similarity_cfg = params.get("clustering", {}) or {}
+
+    feature_names = get_enabled_feature_names(enabled)
+    instances: List[LTRInstance] = []
+
+    q_by_id = {q.id: q for q in queries}
+    for topic_id in sorted(q_by_id.keys()):
+        q = q_by_id[topic_id]
+        docs = list(doc_candidates_by_topic.get(topic_id, []))
+        ranked_passages = list(ranked_passages_by_topic.get(topic_id, []))
+        clusters = list(clusters_by_topic.get(topic_id, []))
+
+        doc_rank = _rank_map_docs(docs)
+        passage_rank = _rank_map_passages(ranked_passages)
+
+        qrels_topic = qrels.get(topic_id, {})
+
+        for cl in clusters:
+            ctx = FeatureContext(
+                query=q,
+                cluster=cl,
+                passages=ranked_passages,
+                passage_rank=passage_rank,
+                document_rank=doc_rank,
+                stopwords=DEFAULT_STOPWORDS,
+                similarity_cfg=similarity_cfg,
+                max_pairwise=max_pairwise,
+            )
+            feats = compute_cluster_features(ctx=ctx, enabled_features=feature_names)
+
+            docs_in_cluster = {
+                ranked_passages[i].document_id
+                for i in cl.passage_indices
+                if 0 <= i < len(ranked_passages)
+            }
+            label = 0
+            if qrels_topic and docs_in_cluster:
+                for docid in docs_in_cluster:
+                    rel = int(qrels_topic.get(docid, 0))
+                    if rel >= label_rel_threshold:
+                        label = 1
+                        break
+
+            instances.append(
+                LTRInstance(
+                    topic_id=topic_id,
+                    docid=f"cl_{cl.id}",
+                    label=label,
+                    features={n: float(feats.get(n, 0.0)) for n in feature_names},
+                )
+            )
+
+    return instances, feature_names
+
+
 def write_ltr_csv(instances: Sequence[LTRInstance], feature_names: Sequence[str], output_path: str) -> None:
     """Write LTR instances to CSV for debugging / offline training."""
     import csv

@@ -6,9 +6,10 @@ Pipeline (per query):
 3) Extract passages (PR2)
 4) Rank passages locally with BM25/QLD (PR3)
 5) Cluster passages (PR4)
-6) Compute cluster features and aggregate to documents (PR5/PR6)
-7) Train/load SVM and score documents (PR7)
-8) Produce a reranked doc run (TREC run file handled by main.py)
+6) Build cluster-level features / instances (PR5/PR6)
+7) Train/load SVM and score clusters (PR7)
+8) Re-rank clusters -> re-rank passages -> RRF over passages -> score documents
+9) Produce a reranked doc run (TREC run file handled by main.py)
 """
 
 from __future__ import annotations
@@ -20,14 +21,47 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from rag.config import ApproachConfig, default_approach2_config
 from rag.clustpsg.cluster import cluster_passages
-from rag.clustpsg.dataset import build_doc_level_training_set
+from rag.clustpsg.dataset import build_cluster_level_training_set
 from rag.clustpsg.doc_retrieval import retrieve_doc_candidates
 from rag.clustpsg.model import load_model, save_model, score_documents, train_model_from_config
 from rag.clustpsg.passage_extraction import passages_by_topic
 from rag.clustpsg.passage_retrieval import rank_passages
 from rag.io import load_qrels
 from rag.training_utils import augment_candidates_with_qrels
-from rag.types import Document, Query
+from rag.types import Document, Passage, Query
+
+
+def _norm_scores(values: List[float], mode: str) -> List[float]:
+    mode = (mode or "none").lower()
+    if not values:
+        return []
+    if mode in ("none", ""):
+        return list(values)
+    if mode == "zscore":
+        m_ = sum(values) / float(len(values))
+        v_ = sum((x - m_) ** 2 for x in values) / float(len(values))
+        s_ = math.sqrt(v_)
+        if s_ <= 1e-12:
+            return [0.0 for _ in values]
+        return [(x - m_) / s_ for x in values]
+    if mode == "minmax":
+        mn, mx = min(values), max(values)
+        if abs(mx - mn) <= 1e-12:
+            return [0.0 for _ in values]
+        return [(x - mn) / (mx - mn) for x in values]
+    raise ValueError(f"Unknown normalization mode: {mode!r} (use none|zscore|minmax)")
+
+
+def _rrf_doc_scores(passages_ranked: Sequence[Passage], *, k: int, depth: int) -> Dict[str, float]:
+    """Reciprocal Rank Fusion over a ranked list of passages -> document scores."""
+    if k < 0:
+        k = 0
+    if depth <= 0:
+        depth = len(passages_ranked)
+    out: Dict[str, float] = {}
+    for r, p in enumerate(passages_ranked[:depth], start=1):
+        out[p.document_id] = out.get(p.document_id, 0.0) + (1.0 / float(k + r))
+    return out
 
 
 def _fetch_doc_contents(searcher, docid: str) -> str:
@@ -187,7 +221,7 @@ def clustpsg_run(
         plist = ranked_passages_by_topic.get(q.id, [])
         clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
 
-    # 6) Build doc-level instances:
+    # 6) Build cluster-level instances:
     # - training instances come from the chosen training doc source
     # - inference instances come from retrieved candidates and do not need qrels
     train_instances: List = []
@@ -206,7 +240,7 @@ def clustpsg_run(
         for q in queries:
             plist = train_ranked_passages.get(q.id, [])
             train_clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
-        train_instances, feature_names = build_doc_level_training_set(
+        train_instances, feature_names = build_cluster_level_training_set(
             queries=queries,
             qrels=qrels,
             doc_candidates_by_topic=train_docs_by_topic,
@@ -215,7 +249,7 @@ def clustpsg_run(
             config=cfg,
         )
 
-    instances, _feature_names_infer = build_doc_level_training_set(
+    instances, _feature_names_infer = build_cluster_level_training_set(
         queries=queries,
         qrels={},  # no labels needed for inference scoring
         doc_candidates_by_topic=doc_candidates_by_topic,
@@ -235,8 +269,67 @@ def clustpsg_run(
         log.info("Saved clustpsg model metadata to %s (backend=%s)", model_path, m.model_type)
     m = load_model(model_path)
 
-    # 8) Score docs and produce reranked run
-    scores = score_documents(model=m, instances=instances)
+    # 8) Score clusters -> propagate to passages -> RRF -> doc scores
+    cluster_scores = score_documents(model=m, instances=instances)  # dict[(topic_id, "cl_<id>")] -> score
+
+    passage_rerank_cfg = (params.get("passage_rerank") or {})
+    # Mix base passage retrieval score with cluster SVM score.
+    pr_beta = float(passage_rerank_cfg.get("beta", 0.7))  # 0 => only passage score, 1 => only cluster score
+    pr_beta = min(1.0, max(0.0, pr_beta))
+    pr_cluster_norm = str(passage_rerank_cfg.get("cluster_norm", "zscore")).lower()
+    pr_passage_norm = str(passage_rerank_cfg.get("passage_norm", "minmax")).lower()
+    pr_cluster_scale = float(passage_rerank_cfg.get("cluster_scale", 1.0))
+    pr_passage_scale = float(passage_rerank_cfg.get("passage_scale", 1.0))
+    pr_cluster_agg = str(passage_rerank_cfg.get("cluster_score_agg", "max")).lower()  # max | mean
+
+    rrf_cfg = (params.get("rrf") or {})
+    rrf_k = int(rrf_cfg.get("k", 60))
+    rrf_depth = int(rrf_cfg.get("depth", 200))
+
+    doc_scores_by_topic: Dict[int, Dict[str, float]] = {}
+    for q in queries:
+        topic_id = q.id
+        ranked_passages = list(ranked_passages_by_topic.get(topic_id, []))
+        clusters = list(clusters_by_topic.get(topic_id, []))
+
+        # Map each passage to the set of cluster scores for clusters containing it (clusters may overlap).
+        pass_to_cluster_scores: Dict[tuple[str, int], List[float]] = {}
+        for cl in clusters:
+            cl_score = float(cluster_scores.get((topic_id, f"cl_{cl.id}"), 0.0))
+            for pi in cl.passage_indices:
+                if 0 <= pi < len(ranked_passages):
+                    p = ranked_passages[pi]
+                    pass_to_cluster_scores.setdefault((p.document_id, p.index), []).append(cl_score)
+
+        base_scores: List[float] = [float(p.score) if p.score is not None else 0.0 for p in ranked_passages]
+        cl_scores: List[float] = []
+        for p in ranked_passages:
+            cs = pass_to_cluster_scores.get((p.document_id, p.index), [])
+            if not cs:
+                cl_scores.append(0.0)
+            elif pr_cluster_agg == "max":
+                cl_scores.append(max(cs))
+            elif pr_cluster_agg == "mean":
+                cl_scores.append(sum(cs) / float(len(cs)))
+            else:
+                raise ValueError(f"Unknown passage_rerank.cluster_score_agg: {pr_cluster_agg!r} (use max|mean)")
+
+        base_norm = _norm_scores(base_scores, pr_passage_norm)
+        cl_norm = _norm_scores(cl_scores, pr_cluster_norm)
+
+        reranked_scored: List[tuple[float, Passage]] = []
+        for p, b, c in zip(ranked_passages, base_norm, cl_norm):
+            combined = (1.0 - pr_beta) * (pr_passage_scale * float(b)) + pr_beta * (pr_cluster_scale * float(c))
+            reranked_scored.append(
+                (
+                    combined,
+                    Passage(document_id=p.document_id, index=p.index, content=p.content, score=combined),
+                )
+            )
+        reranked_scored.sort(key=lambda x: (-x[0], x[1].document_id, x[1].index))
+        reranked_passages = [p for _s, p in reranked_scored]
+
+        doc_scores_by_topic[topic_id] = _rrf_doc_scores(reranked_passages, k=rrf_k, depth=rrf_depth)
     run: Dict[int, List[Tuple[str, float]]] = {}
     for topic_id, docs in doc_candidates_by_topic.items():
         # Tie-break by original retrieval order, not docid (keeps behavior closer to baseline).
@@ -245,8 +338,6 @@ def clustpsg_run(
         rerank_cfg = (params.get("rerank") or {})
         rerank_topn = int(rerank_cfg.get("topn", 200))
         alpha = float(rerank_cfg.get("alpha", 0.2))
-        svm_norm = str(rerank_cfg.get("svm_norm", "none")).lower()
-        svm_scale = float(rerank_cfg.get("svm_scale", 1.0))
         if rerank_topn < 0:
             rerank_topn = 0
         if alpha < 0.0:
@@ -256,38 +347,21 @@ def clustpsg_run(
 
         # Baseline score: use retrieval score if present, else 0.0 for appended qrels docs.
         baseline = {d.id: float(d.score) if d.score is not None else 0.0 for d in docs}
+        rrf_doc = doc_scores_by_topic.get(topic_id, {})
 
         # Only rerank within top-N. Outside that window, keep baseline ordering.
         head = docs[:rerank_topn]
         tail = docs[rerank_topn:]
 
-        # Collect SVM scores for normalization (per-topic).
-        raw_svm = [float(scores.get((topic_id, d.id), 0.0)) for d in head]
-        norm_svm: List[float] = []
-        if not raw_svm:
-            norm_svm = []
-        elif svm_norm in ("none", ""):
-            norm_svm = raw_svm
-        elif svm_norm == "zscore":
-            m_ = sum(raw_svm) / float(len(raw_svm))
-            v_ = sum((x - m_) ** 2 for x in raw_svm) / float(len(raw_svm))
-            s_ = math.sqrt(v_)
-            if s_ <= 1e-12:
-                norm_svm = [0.0 for _ in raw_svm]
-            else:
-                norm_svm = [(x - m_) / s_ for x in raw_svm]
-        elif svm_norm == "minmax":
-            mn, mx = min(raw_svm), max(raw_svm)
-            if abs(mx - mn) <= 1e-12:
-                norm_svm = [0.0 for _ in raw_svm]
-            else:
-                norm_svm = [(x - mn) / (mx - mn) for x in raw_svm]
-        else:
-            raise ValueError(f"Unknown rerank.svm_norm: {svm_norm!r} (use none|zscore|minmax)")
+        # Collect RRF document scores for normalization (per-topic, within rerank window).
+        raw_rrf = [float(rrf_doc.get(d.id, 0.0)) for d in head]
+        rrf_norm = str(rerank_cfg.get("rrf_norm", "minmax")).lower()
+        rrf_scale = float(rerank_cfg.get("rrf_scale", 1.0))
+        norm_rrf = _norm_scores(raw_rrf, rrf_norm)
 
         head_pairs: List[Tuple[str, float]] = []
-        for d, svm_s in zip(head, norm_svm):
-            final = alpha * (svm_scale * svm_s) + (1.0 - alpha) * baseline.get(d.id, 0.0)
+        for d, rrf_s in zip(head, norm_rrf):
+            final = alpha * (rrf_scale * float(rrf_s)) + (1.0 - alpha) * baseline.get(d.id, 0.0)
             head_pairs.append((d.id, final))
         head_pairs.sort(key=lambda x: (-x[1], orig_rank.get(x[0], 10**9)))
 

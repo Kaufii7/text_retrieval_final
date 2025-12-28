@@ -73,6 +73,22 @@ def default_approach2_config() -> ApproachConfig:
             # max | sum | mean
             "doc_feature_aggregation": "max",
 
+            # PR8 passage re-ranking and fusion (cluster -> passage -> document)
+            "passage_rerank": {
+                # Linear mix: combined = (1-beta)*passage + beta*cluster
+                "beta": 0.7,
+                # Normalize scores per topic before mixing: none | zscore | minmax
+                "passage_norm": "minmax",
+                "cluster_norm": "zscore",
+                # Additional multipliers (after normalization)
+                "passage_scale": 1.0,
+                "cluster_scale": 1.0,
+                # How to aggregate overlapping cluster scores for a passage: max | mean
+                "cluster_score_agg": "max",
+            },
+            # RRF parameters for converting passage ranking -> document scores
+            "rrf": {"k": 60, "depth": 200},
+
             # PR7 SVM hyperparameters / persistence
             "svm": {
                 # Backend: "svm_rank" (Joachims SVM^rank) or "linear_svc" (sklearn baseline)
@@ -85,8 +101,8 @@ def default_approach2_config() -> ApproachConfig:
                 "model_path": "models/clustpsg_svm.pkl",
 
                 # SVM^rank binaries + paths (must be installed on your machine and in PATH, or provide absolute paths)
-                "svm_rank_learn_bin": "svm_rank_learn",
-                "svm_rank_classify_bin": "svm_rank_classify",
+                "svm_rank_learn_bin": "svm_rank/svm_rank_learn",
+                "svm_rank_classify_bin": "svm_rank/svm_rank_classify",
                 # Where to write svmrank train/test files and predictions
                 "svm_rank_work_dir": "models/svmrank_work",
                 # Where svm_rank_learn writes the external model file
@@ -111,16 +127,16 @@ def default_approach2_config() -> ApproachConfig:
 
             # PR8 reranking control: keep clustpsg from wrecking a strong baseline.
             # - Only rerank within the top-N retrieved documents.
-            # - Blend SVM score with baseline retrieval score.
+            # - Blend clustpsg doc score (via passage-level RRF) with baseline retrieval score.
             "rerank": {
                 "topn": 1000,
-                # final = alpha * svm + (1-alpha) * baseline
+                # final = alpha * clustpsg + (1-alpha) * baseline
                 "alpha": 0.8,
-                # Optional normalization of per-query SVM decision scores before blending:
+                # Optional normalization of per-query clustpsg doc scores before blending:
                 # none | zscore | minmax
-                "svm_norm": "zscore",
-                # Additional multiplier applied to the (optionally normalized) SVM score.
-                "svm_scale": 1.0,
+                "rrf_norm": "minmax",
+                # Additional multiplier applied to the (optionally normalized) clustpsg score.
+                "rrf_scale": 1.0,
             },
         },
         candidates_depth=None,
