@@ -1,0 +1,7 @@
+{
+  "key": "2f0fa5dc08da81d4e0d0",
+  "n_passages": 10000,
+  "n_topics": 50,
+  "stage": "train",
+  "topk": 200
+}

@@ -102,6 +102,7 @@ def build_doc_level_training_set(
     queries: Sequence[Query],
     qrels: Mapping[int, Mapping[str, int]],
     doc_candidates_by_topic: Mapping[int, Sequence[Document]],
+    doc_rank_candidates_by_topic: Mapping[int, Sequence[Document]] | None = None,
     ranked_passages_by_topic: Mapping[int, Sequence[Passage]],
     clusters_by_topic: Mapping[int, Sequence[Cluster]],
     config: ApproachConfig,
@@ -135,7 +136,18 @@ def build_doc_level_training_set(
         ranked_passages = list(ranked_passages_by_topic.get(topic_id, []))
         clusters = list(clusters_by_topic.get(topic_id, []))
 
-        doc_rank = _rank_map_docs(docs)
+        # Important: some features depend on document rank (retrieval order).
+        # When training docs come from qrels (sorted docids), `docs` is NOT in retrieval order.
+        # Allow passing a separate candidate list to define a consistent rank signal.
+        rank_docs = list((doc_rank_candidates_by_topic or {}).get(topic_id, docs))
+        # Ensure every doc we build instances for has a rank (missing => would become 0 RR).
+        # We append unseen docs after the ranked list, preserving `docs` order.
+        seen = {d.id for d in rank_docs}
+        for d in docs:
+            if d.id not in seen:
+                rank_docs.append(d)
+                seen.add(d.id)
+        doc_rank = _rank_map_docs(rank_docs)
         passage_rank = _rank_map_passages(ranked_passages)
 
         # Prepare empty feature accumulators per doc
@@ -180,6 +192,7 @@ def build_cluster_level_training_set(
     queries: Sequence[Query],
     qrels: Mapping[int, Mapping[str, int]],
     doc_candidates_by_topic: Mapping[int, Sequence[Document]],
+    doc_rank_candidates_by_topic: Mapping[int, Sequence[Document]] | None = None,
     ranked_passages_by_topic: Mapping[int, Sequence[Passage]],
     clusters_by_topic: Mapping[int, Sequence[Cluster]],
     config: ApproachConfig,
@@ -213,7 +226,14 @@ def build_cluster_level_training_set(
         ranked_passages = list(ranked_passages_by_topic.get(topic_id, []))
         clusters = list(clusters_by_topic.get(topic_id, []))
 
-        doc_rank = _rank_map_docs(docs)
+        rank_docs = list((doc_rank_candidates_by_topic or {}).get(topic_id, docs))
+        # Ensure every doc we might reference (via passages) has a rank signal.
+        seen = {d.id for d in rank_docs}
+        for d in docs:
+            if d.id not in seen:
+                rank_docs.append(d)
+                seen.add(d.id)
+        doc_rank = _rank_map_docs(rank_docs)
         passage_rank = _rank_map_passages(ranked_passages)
 
         qrels_topic = qrels.get(topic_id, {})

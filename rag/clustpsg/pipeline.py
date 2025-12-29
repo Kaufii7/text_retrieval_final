@@ -370,6 +370,8 @@ def clustpsg_run(
             queries=queries,
             qrels=qrels,
             doc_candidates_by_topic=train_docs_by_topic,
+            # Use retrieval candidates to define document rank features consistently with inference.
+            doc_rank_candidates_by_topic=doc_candidates_by_topic,
             ranked_passages_by_topic=train_ranked_passages_by_topic,
             clusters_by_topic=train_clusters_by_topic,
             config=cfg,

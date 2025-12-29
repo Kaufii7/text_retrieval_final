@@ -120,7 +120,7 @@ def default_approach2_config() -> ApproachConfig:
             "doc_content_topk": 1000,
             "clustering_max_passages": 200,
             # Candidate generation depth for clustpsg (retrieve this many docs, then rerank, then output topk=1000).
-            "doc_candidates_depth": 2000,
+            "doc_candidates_depth": 5000,
 
             # Training-time: include *all* judged qrels docids as candidates, even if retrieval is top-k capped.
             "train_include_all_qrels_docs": True,

@@ -6,7 +6,7 @@ SVM-light Version V6.20
 1 # kernel parameter -r 
 empty# kernel parameter -u 
 7 # highest feature index 
-27 # number of training documents 
+35 # number of training documents 
 2 # number of support vectors plus 1 
 0 # threshold b, each following line is a SV (starting with alpha*y)
-1 1:0.79784214 2:-0.81807798 3:0.85687947 4:0.17838733 5:-1.3815612 6:3.1281033 #
+1 1:0.624789 2:-1.2247133 3:0.7713629 4:0.20522876 5:6.1130924 6:0.77556646 #
