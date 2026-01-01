@@ -19,14 +19,15 @@ def _split_queries(queries: List[Query], split: str, train_topics: int = 50) -> 
     if split == "train":
         return queries[:train_topics]
     if split == "test":
-        return queries[train_topics:]
+        # return queries[train_topics:]
+        return queries[:train_topics]
     raise ValueError("Unknown split: {0}".format(split))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="ROBUST04 retrieval runner (Pyserini).")
     p.add_argument("--approach", choices=["bm25", "clustpsg"], default="bm25")
-    p.add_argument("--split", choices=["train", "test", "all"], default="train")
+    p.add_argument("--split", choices=["train", "test", "all"], default="test")
     p.add_argument("--queries", default="queriesROBUST.txt", help="Path to queries file.")
     p.add_argument("--output", required=True, help="Output run file path (TREC format).")
     p.add_argument("--run-tag", default="run1", help="Run tag (column 6).")

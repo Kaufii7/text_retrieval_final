@@ -28,7 +28,7 @@ def default_approach2_config() -> ApproachConfig:
             # - docs: BM25 + QLD(mu=1000)
             # - passages: BM25 + QLD(mu=1000) (requires a passage index)
             "doc_retrieval": {"model": "bm25", "qld_mu": 1000},
-            "passage_retrieval": {"model": "bm25", "qld_mu": 1000},
+            "passage_retrieval": {"model": "bm25", "qld_mu": 1000, "per_doc": True, "per_doc_topn": 20},
 
             # Passage extraction (based on `rag_system/passages.py`):
             "min_sentences": 3,
@@ -39,14 +39,14 @@ def default_approach2_config() -> ApproachConfig:
 
             # PR4 clustering configuration (pluggable methods + hyperparameters)
             "clustering": {
-                # For graph_threshold, we default to KL-based similarity over unigram LMs:
-                "vectorizer": "lm",  # lm | tfidf | jaccard | embeddings | custom
-                "similarity": "kl",  # kl | cosine | dot | jaccard | custom
+                # Faster defaults: TF-IDF + cosine (much cheaper than LM+KL)
+                "vectorizer": "tfidf",  # lm | tfidf | jaccard | embeddings | custom
+                "similarity": "cosine",  # kl | cosine | dot | jaccard | custom
                 # Default is dependency-free:
                 "algorithm": "graph_threshold",  # graph_threshold | kmeans | agglomerative | dbscan
                 "random_state": 42,
                 # Used by graph_threshold:
-                "threshold": 0.5,
+                "threshold": 0.2,
                 # Max number of passages in a single centered cluster (including the center passage).
                 "max_cluster_size": 5,
                 # Vectorizer params (tfidf example)
@@ -96,10 +96,10 @@ def default_approach2_config() -> ApproachConfig:
             "final": {
                 # If true, cluster scores come from RankSVM predictions.
                 # If false, cluster scores are derived from the cluster seed passage rank.
-                "use_svm_cluster_scores": False,
-                "max_passages_per_doc": 3,  # M
-                "lambda_min": 0.2,
-                "lambda_max": 0.8,
+                "use_svm_cluster_scores": True,
+                "max_passages_per_doc": 200,  # M
+                "lambda_min": 0.0,
+                "lambda_max": 1.0,
             },
 
             # Cache ranked passages to speed up iterative runs (especially when only tuning downstream params).
@@ -131,6 +131,7 @@ def default_approach2_config() -> ApproachConfig:
 
             # PR8 pipeline limits (runtime control during development)
             "doc_content_topk": 1000,
+            # Fewer passages => much faster O(n^2) clustering
             "clustering_max_passages": 200,
             # Candidate generation depth for clustpsg (retrieve this many docs, then rerank, then output topk=1000).
             "doc_candidates_depth": 2000,
