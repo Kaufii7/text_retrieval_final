@@ -48,7 +48,7 @@ def default_approach2_config() -> ApproachConfig:
                 # Used by graph_threshold:
                 "threshold": 0.5,
                 # Max number of passages in a single centered cluster (including the center passage).
-                "max_cluster_size": 20,
+                "max_cluster_size": 5,
                 # Vectorizer params (tfidf example)
                 "tfidf": {"ngram_range": (1, 1), "min_df": 1, "max_df": 1.0, "max_features": None},
                 # Embeddings params (if used)
@@ -94,6 +94,9 @@ def default_approach2_config() -> ApproachConfig:
             # - Sum reciprocal ranks of top passages per doc (cap M)
             # - Fuse with BM25 doc reciprocal rank using adaptive lambda based on how many top passages the doc got
             "final": {
+                # If true, cluster scores come from RankSVM predictions.
+                # If false, cluster scores are derived from the cluster seed passage rank.
+                "use_svm_cluster_scores": False,
                 "max_passages_per_doc": 3,  # M
                 "lambda_min": 0.2,
                 "lambda_max": 0.8,
@@ -102,7 +105,7 @@ def default_approach2_config() -> ApproachConfig:
             # Cache ranked passages to speed up iterative runs (especially when only tuning downstream params).
             # Cache key includes: queries + docids used + extraction params + passage_retrieval params + topk.
             "passage_cache": {
-                "enabled": True,
+                "enabled": False,
                 "dir": "cache/ranked_passages",
             },
 
@@ -130,7 +133,7 @@ def default_approach2_config() -> ApproachConfig:
             "doc_content_topk": 1000,
             "clustering_max_passages": 200,
             # Candidate generation depth for clustpsg (retrieve this many docs, then rerank, then output topk=1000).
-            "doc_candidates_depth": 5000,
+            "doc_candidates_depth": 2000,
 
             # Training-time: include *all* judged qrels docids as candidates, even if retrieval is top-k capped.
             "train_include_all_qrels_docs": True,

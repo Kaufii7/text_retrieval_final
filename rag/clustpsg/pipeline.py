@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import json
 import math
+import time
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from rag.config import ApproachConfig, default_approach2_config
@@ -233,6 +234,7 @@ def clustpsg_run(
     log = logger or logging.getLogger("rag.clustpsg.pipeline")
     cfg = config or default_approach2_config()
     params = cfg.params or {}
+    t_run0 = time.perf_counter()
 
     cache_cfg = (params.get("passage_cache") or {})
     cache_enabled = bool(cache_cfg.get("enabled", False))
@@ -258,6 +260,7 @@ def clustpsg_run(
     train_docs_by_topic: Dict[int, List[Document]] = {}
     train_ranked_passages_by_topic: Dict[int, List] | None = None
     if split == "train":
+        log.info("Stage(train): preparing training docs (source=%s)", train_docs_source)
         if train_docs_source == "qrels":
             # Use judged documents only (both relevant and non-relevant).
             # If passage cache is enabled and available, we can skip fetching contents entirely.
@@ -328,9 +331,12 @@ def clustpsg_run(
             raise ValueError(f"Unknown train_docs_source: {train_docs_source!r} (use 'qrels' or 'retrieved')")
 
     # --- Inference candidates for producing a run (train/test) ---
+    t0 = time.perf_counter()
+    log.info("Stage(inference): retrieving doc candidates (depth=%d)", doc_candidates_depth)
     doc_candidates_by_topic = retrieve_doc_candidates(
         queries=queries, searcher=searcher, topk=doc_candidates_depth, config=cfg, logger=log
     )
+    log.info("Stage(inference): retrieved doc candidates in %.2fs", time.perf_counter() - t0)
 
     # 2-4) Fetch contents -> extract passages -> rank passages (with optional cache)
     cap = train_doc_content_topk if split == "train" else doc_content_topk
@@ -340,6 +346,7 @@ def clustpsg_run(
     }
     ranked_passages_by_topic = None
     if cache_enabled:
+        t0 = time.perf_counter()
         ranked_passages_by_topic = load_ranked_passages(
             cache_dir=cache_dir,
             stage="inference",
@@ -349,17 +356,27 @@ def clustpsg_run(
             cfg=cfg,
         )
         if ranked_passages_by_topic is not None:
-            log.info("Loaded cached ranked passages (stage=inference) from %s", cache_dir)
+            log.info("Loaded cached ranked passages (stage=inference) from %s in %.2fs", cache_dir, time.perf_counter() - t0)
         else:
-            log.info("No cached ranked passages found (stage=inference); computing and caching to %s", cache_dir)
+            log.info(
+                "No cached ranked passages found (stage=inference); computing and caching to %s (checked in %.2fs)",
+                cache_dir,
+                time.perf_counter() - t0,
+            )
 
     if ranked_passages_by_topic is None:
+        t0 = time.perf_counter()
+        log.info("Stage(inference): fetching doc contents (cap=%d)", int(cap))
         docs_with_content_by_topic: Dict[int, List[Document]] = {}
         for topic_id in sorted(doc_candidates_by_topic.keys()):
             docs = doc_candidates_by_topic[topic_id]
             docs_with_content_by_topic[topic_id] = _with_contents(searcher=searcher, docs=docs, topk=int(cap))
+        log.info("Stage(inference): fetched doc contents in %.2fs", time.perf_counter() - t0)
 
+        t0 = time.perf_counter()
+        log.info("Stage(inference): extracting passages")
         extracted_passages_by_topic = passages_by_topic(docs_with_content_by_topic, cfg=cfg)
+        log.info("Stage(inference): extracted passages in %.2fs", time.perf_counter() - t0)
 
         ranked_passages_by_topic = rank_passages(
             queries=queries,
@@ -370,6 +387,7 @@ def clustpsg_run(
             stage="inference",
         )
         if cache_enabled:
+            t0 = time.perf_counter()
             save_ranked_passages(
                 cache_dir=cache_dir,
                 stage="inference",
@@ -379,6 +397,7 @@ def clustpsg_run(
                 cfg=cfg,
                 ranked_passages_by_topic=ranked_passages_by_topic,
             )
+            log.info("Saved ranked passages cache (stage=inference) in %.2fs", time.perf_counter() - t0)
 
     # If we're only precomputing caches, stop here (no need for clustering/SVM).
     if precompute_only:
@@ -410,10 +429,13 @@ def clustpsg_run(
 
     # 5) Cluster passages per topic (over the ranked list)
     clustering_cfg = params.get("clustering", {}) or {}
+    t0 = time.perf_counter()
+    log.info("Stage(inference): clustering passages (topics=%d)", len(queries))
     clusters_by_topic = {}
     for q in queries:
         plist = ranked_passages_by_topic.get(q.id, [])
         clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
+    log.info("Stage(inference): clustered passages in %.2fs", time.perf_counter() - t0)
 
     # 6) Build cluster-level instances:
     # - training instances come from the chosen training doc source
@@ -423,7 +445,10 @@ def clustpsg_run(
     if split == "train":
         # Build a training pipeline over the training docs (can be cached)
         if train_ranked_passages_by_topic is None:
+            t0 = time.perf_counter()
+            log.info("Stage(train): extracting passages (uncached)")
             train_passages = passages_by_topic(train_docs_by_topic, cfg=cfg)
+            log.info("Stage(train): extracted passages in %.2fs", time.perf_counter() - t0)
             train_ranked_passages = rank_passages(
                 queries=queries,
                 passages_by_topic=train_passages,
@@ -434,6 +459,7 @@ def clustpsg_run(
             )
             train_ranked_passages_by_topic = train_ranked_passages
             if cache_enabled:
+                t0 = time.perf_counter()
                 train_docids_for_cache = {tid: [d.id for d in train_docs_by_topic.get(tid, [])] for tid in sorted(train_docs_by_topic.keys())}
                 save_ranked_passages(
                     cache_dir=cache_dir,
@@ -444,10 +470,20 @@ def clustpsg_run(
                     cfg=cfg,
                     ranked_passages_by_topic=train_ranked_passages_by_topic,
                 )
+                log.info("Saved ranked passages cache (stage=train) in %.2fs", time.perf_counter() - t0)
+        else:
+            log.info("Stage(train): using cached ranked passages (no extraction/ranking)")
+
+        t0 = time.perf_counter()
+        log.info("Stage(train): clustering passages (topics=%d)", len(queries))
         train_clusters_by_topic = {}
         for q in queries:
             plist = train_ranked_passages_by_topic.get(q.id, [])
             train_clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
+        log.info("Stage(train): clustered passages in %.2fs", time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        log.info("Stage(train): building cluster-level training instances")
         train_instances, feature_names = build_cluster_level_training_set(
             queries=queries,
             qrels=qrels,
@@ -458,7 +494,10 @@ def clustpsg_run(
             clusters_by_topic=train_clusters_by_topic,
             config=cfg,
         )
+        log.info("Stage(train): built %d training instances in %.2fs", len(train_instances), time.perf_counter() - t0)
 
+    t0 = time.perf_counter()
+    log.info("Stage(inference): building cluster-level inference instances")
     instances, _feature_names_infer = build_cluster_level_training_set(
         queries=queries,
         qrels={},  # no labels needed for inference scoring
@@ -467,6 +506,7 @@ def clustpsg_run(
         clusters_by_topic=clusters_by_topic,
         config=cfg,
     )
+    log.info("Stage(inference): built %d inference instances in %.2fs", len(instances), time.perf_counter() - t0)
     if not feature_names:
         feature_names = _feature_names_infer
 
@@ -474,18 +514,32 @@ def clustpsg_run(
     svm_cfg = (params.get("svm") or {})
     model_path = str(svm_cfg.get("model_path", "models/clustpsg_svm.pkl"))
     if split == "train" and train_model:
+        t0 = time.perf_counter()
+        log.info("Stage(train): training model (backend=%s)", str(svm_cfg.get("backend", "svm_rank")))
         m = train_model_from_config(instances=train_instances, feature_names=feature_names, svm_cfg=svm_cfg)
         save_model(m, model_path)
-        log.info("Saved clustpsg model metadata to %s (backend=%s)", model_path, m.model_type)
+        log.info("Saved clustpsg model metadata to %s (backend=%s) in %.2fs", model_path, m.model_type, time.perf_counter() - t0)
+    t0 = time.perf_counter()
+    log.info("Stage(inference): loading model from %s", model_path)
     m = load_model(model_path)
+    log.info("Stage(inference): loaded model (backend=%s) in %.2fs", m.model_type, time.perf_counter() - t0)
 
     # 8) Score clusters -> propagate to passages -> RRF -> doc scores
-    cluster_scores = score_documents(model=m, instances=instances)  # dict[(topic_id, "cl_<id>")] -> score
-
     final_cfg = (params.get("final") or {})
+    use_svm_cluster_scores = bool(final_cfg.get("use_svm_cluster_scores", True))
     max_passages_per_doc = int(final_cfg.get("max_passages_per_doc", 3))
     lambda_min = float(final_cfg.get("lambda_min", 0.2))
     lambda_max = float(final_cfg.get("lambda_max", 0.8))
+
+    cluster_scores: Dict[Tuple[int, str], float] = {}
+    if use_svm_cluster_scores:
+        t0 = time.perf_counter()
+        log.info("Stage(inference): scoring clusters with model")
+        # RankSVM: (topic_id, "cl_<id>") -> score
+        cluster_scores = score_documents(model=m, instances=instances)
+        log.info("Stage(inference): scored %d clusters in %.2fs", len(cluster_scores), time.perf_counter() - t0)
+    else:
+        log.info("Stage(inference): cluster scoring uses seed passage ranks (no model scoring)")
 
     rerank_cfg = (params.get("rerank") or {})
     rerank_topn = int(rerank_cfg.get("topn", 1000))
@@ -493,6 +547,8 @@ def clustpsg_run(
         rerank_topn = 0
 
     run: Dict[int, List[Tuple[str, float]]] = {}
+    t0 = time.perf_counter()
+    log.info("Stage(inference): reranking documents (topics=%d)", len(queries))
     for q in queries:
         topic_id = q.id
         docs = list(doc_candidates_by_topic.get(topic_id, []))
@@ -502,8 +558,17 @@ def clustpsg_run(
         orig_doc_rank = {d.id: i for i, d in enumerate(docs, start=1)}
         bm25_rr = {d.id: (1.0 / float(orig_doc_rank[d.id])) for d in docs if d.id in orig_doc_rank}
 
-        # Cluster.id -> score (score_documents uses "cl_<id>")
-        cs_by_id: Dict[int, float] = {cl.id: float(cluster_scores.get((topic_id, f"cl_{cl.id}"), 0.0)) for cl in clusters}
+        # Cluster.id -> score
+        if use_svm_cluster_scores:
+            # SVM predictions (higher is better)
+            cs_by_id: Dict[int, float] = {cl.id: float(cluster_scores.get((topic_id, f"cl_{cl.id}"), 0.0)) for cl in clusters}
+        else:
+            # Seed passage rank (cluster.id is the seed index in the ranked passage list for graph_threshold).
+            # Higher score => better rank, so use reciprocal rank of the seed.
+            cs_by_id = {}
+            for cl in clusters:
+                seed_rank = int(cl.id) + 1  # 1-based
+                cs_by_id[int(cl.id)] = 1.0 / float(seed_rank) if seed_rank > 0 else 0.0
 
         reranked_passages = _rerank_passages_by_cluster_scores(
             ranked_passages,
@@ -540,6 +605,8 @@ def clustpsg_run(
 
         run[topic_id] = (head_pairs + tail_pairs)[:topk]
 
+    log.info("Stage(inference): reranked documents in %.2fs", time.perf_counter() - t0)
+    log.info("clustpsg_run complete in %.2fs", time.perf_counter() - t_run0)
     return run
 
 
