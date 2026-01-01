@@ -89,6 +89,16 @@ def default_approach2_config() -> ApproachConfig:
             # RRF parameters for converting passage ranking -> document scores
             "rrf": {"k": 60, "depth": 200},
 
+            # Final ClustPsg scoring (as per assignment spec):
+            # - Re-rank passages by cluster RankSVM score (tie-break by original passage rank)
+            # - Sum reciprocal ranks of top passages per doc (cap M)
+            # - Fuse with BM25 doc reciprocal rank using adaptive lambda based on how many top passages the doc got
+            "final": {
+                "max_passages_per_doc": 3,  # M
+                "lambda_min": 0.2,
+                "lambda_max": 0.8,
+            },
+
             # Cache ranked passages to speed up iterative runs (especially when only tuning downstream params).
             # Cache key includes: queries + docids used + extraction params + passage_retrieval params + topk.
             "passage_cache": {

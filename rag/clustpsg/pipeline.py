@@ -20,7 +20,7 @@ import math
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from rag.config import ApproachConfig, default_approach2_config
-from rag.clustpsg.cluster import cluster_passages
+from rag.clustpsg.cluster import Cluster, cluster_passages
 from rag.clustpsg.dataset import build_cluster_level_training_set
 from rag.clustpsg.doc_retrieval import retrieve_doc_candidates
 from rag.clustpsg.model import load_model, save_model, score_documents, train_model_from_config
@@ -63,6 +63,88 @@ def _rrf_doc_scores(passages_ranked: Sequence[Passage], *, k: int, depth: int) -
     for r, p in enumerate(passages_ranked[:depth], start=1):
         out[p.document_id] = out.get(p.document_id, 0.0) + (1.0 / float(k + r))
     return out
+
+
+def _rerank_passages_by_cluster_scores(
+    ranked_passages: Sequence[Passage],
+    *,
+    clusters: Sequence[Cluster],
+    cluster_scores_by_id: Mapping[int, float],
+) -> List[Passage]:
+    """Re-rank passages by descending cluster score, tie-breaking by original passage rank.
+
+    Overlap handling: if a passage appears in multiple clusters, it takes the max score
+    across those clusters (i.e., the highest-ranked cluster it appears in).
+    """
+    # Original rank is implied by list order (1 = best).
+    orig_rank: Dict[tuple[str, int], int] = {(p.document_id, p.index): i for i, p in enumerate(ranked_passages, start=1)}
+
+    best_score: Dict[tuple[str, int], float] = {}
+    for cl in clusters:
+        s = float(cluster_scores_by_id.get(int(cl.id), 0.0))
+        for pi in cl.passage_indices:
+            if 0 <= pi < len(ranked_passages):
+                p = ranked_passages[pi]
+                key = (p.document_id, p.index)
+                prev = best_score.get(key)
+                best_score[key] = s if prev is None else (s if s > prev else prev)
+
+    # Deduplicate passages (should already be unique, but keep it robust).
+    seen: set[tuple[str, int]] = set()
+    unique: List[Passage] = []
+    for p in ranked_passages:
+        key = (p.document_id, p.index)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+
+    unique.sort(key=lambda p: (-float(best_score.get((p.document_id, p.index), 0.0)), orig_rank.get((p.document_id, p.index), 10**9)))
+    return unique
+
+
+def _doc_scores_from_ranked_passages_rr(
+    passages_ranked: Sequence[Passage],
+    *,
+    max_passages_per_doc: int,
+) -> tuple[Dict[str, float], Dict[str, int]]:
+    """Sum reciprocal ranks of passages per document, capped to M passages per doc.
+
+    Uses the *global* passage rank (position in `passages_ranked`), per the ClustPsg spec.
+    """
+    if max_passages_per_doc <= 0:
+        return {}, {}
+    score: Dict[str, float] = {}
+    used: Dict[str, int] = {}
+    for r, p in enumerate(passages_ranked, start=1):
+        docid = p.document_id
+        cnt = used.get(docid, 0)
+        if cnt >= max_passages_per_doc:
+            continue
+        score[docid] = score.get(docid, 0.0) + (1.0 / float(r))
+        used[docid] = cnt + 1
+    return score, used
+
+
+def _adaptive_lambda(*, used_passages: int, max_passages_per_doc: int, lambda_min: float, lambda_max: float) -> float:
+    """Adaptive lambda based on how many top passages a document received (0..M).
+
+    Simple linear schedule:
+      lambda = lambda_min + (lambda_max - lambda_min) * (used / M)
+    """
+    if max_passages_per_doc <= 0:
+        return float(lambda_min)
+    x = float(used_passages) / float(max_passages_per_doc)
+    if x < 0.0:
+        x = 0.0
+    if x > 1.0:
+        x = 1.0
+    lam = float(lambda_min) + (float(lambda_max) - float(lambda_min)) * x
+    if lam < 0.0:
+        return 0.0
+    if lam > 1.0:
+        return 1.0
+    return lam
 
 
 def _fetch_doc_contents(searcher, docid: str) -> str:
@@ -400,104 +482,63 @@ def clustpsg_run(
     # 8) Score clusters -> propagate to passages -> RRF -> doc scores
     cluster_scores = score_documents(model=m, instances=instances)  # dict[(topic_id, "cl_<id>")] -> score
 
-    passage_rerank_cfg = (params.get("passage_rerank") or {})
-    # Mix base passage retrieval score with cluster SVM score.
-    pr_beta = float(passage_rerank_cfg.get("beta", 0.7))  # 0 => only passage score, 1 => only cluster score
-    pr_beta = min(1.0, max(0.0, pr_beta))
-    pr_cluster_norm = str(passage_rerank_cfg.get("cluster_norm", "zscore")).lower()
-    pr_passage_norm = str(passage_rerank_cfg.get("passage_norm", "minmax")).lower()
-    pr_cluster_scale = float(passage_rerank_cfg.get("cluster_scale", 1.0))
-    pr_passage_scale = float(passage_rerank_cfg.get("passage_scale", 1.0))
-    pr_cluster_agg = str(passage_rerank_cfg.get("cluster_score_agg", "max")).lower()  # max | mean
+    final_cfg = (params.get("final") or {})
+    max_passages_per_doc = int(final_cfg.get("max_passages_per_doc", 3))
+    lambda_min = float(final_cfg.get("lambda_min", 0.2))
+    lambda_max = float(final_cfg.get("lambda_max", 0.8))
 
-    rrf_cfg = (params.get("rrf") or {})
-    rrf_k = int(rrf_cfg.get("k", 60))
-    rrf_depth = int(rrf_cfg.get("depth", 200))
+    rerank_cfg = (params.get("rerank") or {})
+    rerank_topn = int(rerank_cfg.get("topn", 1000))
+    if rerank_topn < 0:
+        rerank_topn = 0
 
-    doc_scores_by_topic: Dict[int, Dict[str, float]] = {}
+    run: Dict[int, List[Tuple[str, float]]] = {}
     for q in queries:
         topic_id = q.id
+        docs = list(doc_candidates_by_topic.get(topic_id, []))
         ranked_passages = list(ranked_passages_by_topic.get(topic_id, []))
         clusters = list(clusters_by_topic.get(topic_id, []))
 
-        # Map each passage to the set of cluster scores for clusters containing it (clusters may overlap).
-        pass_to_cluster_scores: Dict[tuple[str, int], List[float]] = {}
-        for cl in clusters:
-            cl_score = float(cluster_scores.get((topic_id, f"cl_{cl.id}"), 0.0))
-            for pi in cl.passage_indices:
-                if 0 <= pi < len(ranked_passages):
-                    p = ranked_passages[pi]
-                    pass_to_cluster_scores.setdefault((p.document_id, p.index), []).append(cl_score)
+        orig_doc_rank = {d.id: i for i, d in enumerate(docs, start=1)}
+        bm25_rr = {d.id: (1.0 / float(orig_doc_rank[d.id])) for d in docs if d.id in orig_doc_rank}
 
-        base_scores: List[float] = [float(p.score) if p.score is not None else 0.0 for p in ranked_passages]
-        cl_scores: List[float] = []
-        for p in ranked_passages:
-            cs = pass_to_cluster_scores.get((p.document_id, p.index), [])
-            if not cs:
-                cl_scores.append(0.0)
-            elif pr_cluster_agg == "max":
-                cl_scores.append(max(cs))
-            elif pr_cluster_agg == "mean":
-                cl_scores.append(sum(cs) / float(len(cs)))
-            else:
-                raise ValueError(f"Unknown passage_rerank.cluster_score_agg: {pr_cluster_agg!r} (use max|mean)")
+        # Cluster.id -> score (score_documents uses "cl_<id>")
+        cs_by_id: Dict[int, float] = {cl.id: float(cluster_scores.get((topic_id, f"cl_{cl.id}"), 0.0)) for cl in clusters}
 
-        base_norm = _norm_scores(base_scores, pr_passage_norm)
-        cl_norm = _norm_scores(cl_scores, pr_cluster_norm)
+        reranked_passages = _rerank_passages_by_cluster_scores(
+            ranked_passages,
+            clusters=clusters,
+            cluster_scores_by_id=cs_by_id,
+        )
 
-        reranked_scored: List[tuple[float, Passage]] = []
-        for p, b, c in zip(ranked_passages, base_norm, cl_norm):
-            combined = (1.0 - pr_beta) * (pr_passage_scale * float(b)) + pr_beta * (pr_cluster_scale * float(c))
-            reranked_scored.append(
-                (
-                    combined,
-                    Passage(document_id=p.document_id, index=p.index, content=p.content, score=combined),
-                )
+        passage_rr, used_counts = _doc_scores_from_ranked_passages_rr(
+            reranked_passages,
+            max_passages_per_doc=max_passages_per_doc,
+        )
+
+        # Score documents by adaptive fusion: lambda * passage_rr + (1-lambda) * bm25_rr
+        fused: Dict[str, float] = {}
+        for d in docs:
+            used = int(used_counts.get(d.id, 0))
+            lam = _adaptive_lambda(
+                used_passages=used,
+                max_passages_per_doc=max_passages_per_doc,
+                lambda_min=lambda_min,
+                lambda_max=lambda_max,
             )
-        reranked_scored.sort(key=lambda x: (-x[0], x[1].document_id, x[1].index))
-        reranked_passages = [p for _s, p in reranked_scored]
+            fused[d.id] = lam * float(passage_rr.get(d.id, 0.0)) + (1.0 - lam) * float(bm25_rr.get(d.id, 0.0))
 
-        doc_scores_by_topic[topic_id] = _rrf_doc_scores(reranked_passages, k=rrf_k, depth=rrf_depth)
-    run: Dict[int, List[Tuple[str, float]]] = {}
-    for topic_id, docs in doc_candidates_by_topic.items():
-        # Tie-break by original retrieval order, not docid (keeps behavior closer to baseline).
-        orig_rank = {d.id: i for i, d in enumerate(docs, start=1)}
-
-        rerank_cfg = (params.get("rerank") or {})
-        rerank_topn = int(rerank_cfg.get("topn", 200))
-        alpha = float(rerank_cfg.get("alpha", 0.2))
-        if rerank_topn < 0:
-            rerank_topn = 0
-        if alpha < 0.0:
-            alpha = 0.0
-        if alpha > 1.0:
-            alpha = 1.0
-
-        # Baseline score: use retrieval score if present, else 0.0 for appended qrels docs.
-        baseline = {d.id: float(d.score) if d.score is not None else 0.0 for d in docs}
-        rrf_doc = doc_scores_by_topic.get(topic_id, {})
-
-        # Only rerank within top-N. Outside that window, keep baseline ordering.
+        # Only rerank within top-N docs for safety; keep tail in original BM25 order.
         head = docs[:rerank_topn]
         tail = docs[rerank_topn:]
 
-        # Collect RRF document scores for normalization (per-topic, within rerank window).
-        raw_rrf = [float(rrf_doc.get(d.id, 0.0)) for d in head]
-        rrf_norm = str(rerank_cfg.get("rrf_norm", "minmax")).lower()
-        rrf_scale = float(rerank_cfg.get("rrf_scale", 1.0))
-        norm_rrf = _norm_scores(raw_rrf, rrf_norm)
+        head_pairs = [(d.id, float(fused.get(d.id, 0.0))) for d in head]
+        head_pairs.sort(key=lambda x: (-x[1], orig_doc_rank.get(x[0], 10**9)))
 
-        head_pairs: List[Tuple[str, float]] = []
-        for d, rrf_s in zip(head, norm_rrf):
-            final = alpha * (rrf_scale * float(rrf_s)) + (1.0 - alpha) * baseline.get(d.id, 0.0)
-            head_pairs.append((d.id, final))
-        head_pairs.sort(key=lambda x: (-x[1], orig_rank.get(x[0], 10**9)))
+        # Tail: keep original order, use BM25 reciprocal-rank as a deterministic score.
+        tail_pairs = [(d.id, float(bm25_rr.get(d.id, 0.0))) for d in tail]
 
-        # Tail: keep original order but emit a deterministic score (baseline).
-        tail_pairs = [(d.id, baseline.get(d.id, 0.0)) for d in tail]
-
-        merged = head_pairs + tail_pairs
-        run[topic_id] = merged[:topk]
+        run[topic_id] = (head_pairs + tail_pairs)[:topk]
 
     return run
 
