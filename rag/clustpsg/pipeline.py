@@ -534,6 +534,14 @@ def clustpsg_run(
     lambda_min = float(final_cfg.get("lambda_min", 0.2))
     lambda_max = float(final_cfg.get("lambda_max", 0.8))
     rr_k = int(final_cfg.get("rr_k", 0))
+    cluster_blend_cfg = (final_cfg.get("cluster_score_blend") or {})
+    cluster_blend_alpha = float(cluster_blend_cfg.get("alpha", 1.0))
+    if cluster_blend_alpha < 0.0:
+        cluster_blend_alpha = 0.0
+    if cluster_blend_alpha > 1.0:
+        cluster_blend_alpha = 1.0
+    cluster_blend_svm_norm = str(cluster_blend_cfg.get("svm_norm", "zscore"))
+    cluster_blend_seed_norm = str(cluster_blend_cfg.get("seed_norm", "zscore"))
 
     cluster_scores: Dict[Tuple[int, str], float] = {}
     if use_svm_cluster_scores:
@@ -563,16 +571,27 @@ def clustpsg_run(
         bm25_rr = {d.id: (1.0 / float(orig_doc_rank[d.id])) for d in docs if d.id in orig_doc_rank}
 
         # Cluster.id -> score
+        #
+        # Baseline heuristic: seed passage reciprocal rank (cluster.id is seed index for graph_threshold).
+        # Higher score => better rank.
+        cluster_ids = [int(cl.id) for cl in clusters]
+        seed_raw = []
+        for cid in cluster_ids:
+            seed_rank = cid + 1  # 1-based
+            seed_raw.append(1.0 / float(seed_rank) if seed_rank > 0 else 0.0)
+
         if use_svm_cluster_scores:
-            # SVM predictions (higher is better)
-            cs_by_id: Dict[int, float] = {cl.id: float(cluster_scores.get((topic_id, f"cl_{cl.id}"), 0.0)) for cl in clusters}
+            # SVM predictions (higher is better), blended with the seed heuristic for safety.
+            svm_raw = [float(cluster_scores.get((topic_id, f"cl_{cid}"), 0.0)) for cid in cluster_ids]
+            svm_norm = _norm_scores(svm_raw, mode=cluster_blend_svm_norm)
+            seed_norm = _norm_scores(seed_raw, mode=cluster_blend_seed_norm)
+            cs_by_id = {
+                cid: (cluster_blend_alpha * float(svm_norm[i]) + (1.0 - cluster_blend_alpha) * float(seed_norm[i]))
+                for i, cid in enumerate(cluster_ids)
+            }
         else:
-            # Seed passage rank (cluster.id is the seed index in the ranked passage list for graph_threshold).
-            # Higher score => better rank, so use reciprocal rank of the seed.
-            cs_by_id = {}
-            for cl in clusters:
-                seed_rank = int(cl.id) + 1  # 1-based
-                cs_by_id[int(cl.id)] = 1.0 / float(seed_rank) if seed_rank > 0 else 0.0
+            # Pure heuristic
+            cs_by_id = {cid: float(seed_raw[i]) for i, cid in enumerate(cluster_ids)}
 
         reranked_passages = _rerank_passages_by_cluster_scores(
             ranked_passages,

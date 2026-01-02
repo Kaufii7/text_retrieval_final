@@ -123,7 +123,19 @@ def default_approach2_config() -> ApproachConfig:
             "final": {
                 # If true, cluster scores come from RankSVM predictions.
                 # If false, cluster scores are derived from the cluster seed passage rank.
-                "use_svm_cluster_scores": True,
+                "use_svm_cluster_scores": False,
+                # Safety: blend RankSVM scores with the seed-heuristic cluster score
+                # to reduce degradation from noisy model predictions.
+                #
+                # blended = alpha * norm(svm_score) + (1-alpha) * norm(seed_rr)
+                "cluster_score_blend": {
+                    # alpha=1.0 => pure SVM (old behavior when use_svm_cluster_scores=True)
+                    # alpha=0.0 => pure seed heuristic
+                    "alpha": 0.5,
+                    # Score normalization per topic before blending: none | zscore | minmax
+                    "svm_norm": "zscore",
+                    "seed_norm": "zscore",
+                },
                 # Reciprocal-rank denominator offset (RRF-style): contribution = 1 / (rr_k + rank)
                 "rr_k": 100,
                 "max_passages_per_doc": 200,  # M
