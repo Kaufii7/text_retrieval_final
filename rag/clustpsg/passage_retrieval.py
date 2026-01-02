@@ -31,6 +31,8 @@ from rag.clustpsg.text_scoring import (
     tokenize,
 )
 
+from rag.query_expansion import expand_query_terms_semantic
+
 
 def rank_passages(
     *,
@@ -72,6 +74,8 @@ def rank_passages(
         total_passages += len(passages)
 
         q_terms = tokenize(q.content)
+
+        q_terms = expand_query_terms_semantic(query_terms=q_terms, cfg=config)
 
         def _score_one(tf: Counter, dl: int, *, df, bg, n_docs: int, avgdl: float) -> float:
             if model == "bm25":

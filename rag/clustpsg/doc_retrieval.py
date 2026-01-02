@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Sequence
 
 from rag.config import ApproachConfig
 from rag.lucene_backend import SearchHit, search, set_bm25, set_qld, set_rm3
+from rag.query_expansion import expand_query_text_semantic
 from rag.types import Document, Query
 
 
@@ -76,7 +77,8 @@ def retrieve_doc_candidates(
 
     results_by_topic: Dict[int, List[Document]] = {}
     for q in queries:
-        hits: List[SearchHit] = search(searcher, q.content, topk=topk)
+        query_text = expand_query_text_semantic(query_text=q.content, cfg=config)
+        hits: List[SearchHit] = search(searcher, query_text, topk=topk)
         # We don't fetch full document text here; downstream stages can fetch content
         # if needed via an IndexReader. Rank is implied by list ordering.
         results_by_topic[q.id] = [Document(id=h.docid, content="", score=h.score) for h in hits]

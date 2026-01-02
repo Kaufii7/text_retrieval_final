@@ -42,6 +42,21 @@ def default_approach2_config() -> ApproachConfig:
             },
             "passage_retrieval": {"model": "bm25", "qld_mu": 1000, "per_doc": True, "per_doc_filter": "overlap", "per_doc_filter_k": 10},
 
+            # Conservative semantic query expansion (noun-only via curated synonym map).
+            # Adds up to N extra terms per query to improve recall while limiting drift.
+            "semantic_expansion": {
+                "enabled": False,
+                # "static" uses a small curated noun synonym map (no extra deps).
+                # "nltk_wordnet" uses NLTK POS tagging + WordNet synonyms (noun-only).
+                "backend": "nltk_wordnet",
+                # Recommended: 1-2
+                "max_terms": 5,
+                # NLTK backend: cap how many lemma candidates we consider per noun.
+                "nltk_lemma_max_per_noun": 5,
+                # Static backend only: overrides/extensions to the built-in noun synonym map.
+                "synonyms": {},
+            },
+
             # Passage extraction (based on `rag_system/passages.py`):
             "min_sentences": 3,
             "max_sentences": 5,
