@@ -31,8 +31,8 @@ def default_approach2_config() -> ApproachConfig:
                 # model: "bm25" | "bm25+rm3" | "qld"
                 "model": "bm25+rm3",
                 # BM25 params (used by "bm25" and "bm25+rm3")
-                "k1": 0.9,
-                "b": 0.4,
+                "k1": 1.0, # Term frequency normalization
+                "b": 0.8, # Length normalization
                 # RM3 params (used by "bm25+rm3")
                 "rm3_fb_terms": 10,
                 "rm3_fb_docs": 10,
