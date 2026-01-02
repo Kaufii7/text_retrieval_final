@@ -50,8 +50,26 @@ def _apply_doc_retrieval_model(searcher, cfg: ApproachConfig) -> None:
         set_qld(searcher, mu=mu)
         return
 
+    if model in ("qld+rm3", "qld_rm3", "rm3+qld"):
+        # QLD first stage + RM3 pseudo-relevance feedback query expansion.
+        mu = float(model_cfg.get("qld_mu", 1000))
+        set_qld(searcher, mu=mu)
+
+        fb_terms = int(model_cfg.get("rm3_fb_terms", model_cfg.get("fb_terms", 10)))
+        fb_docs = int(model_cfg.get("rm3_fb_docs", model_cfg.get("fb_docs", 10)))
+        original_query_weight = float(
+            model_cfg.get("rm3_original_query_weight", model_cfg.get("original_query_weight", 0.5))
+        )
+        set_rm3(
+            searcher,
+            fb_terms=fb_terms,
+            fb_docs=fb_docs,
+            original_query_weight=original_query_weight,
+        )
+        return
+
     raise ValueError(
-        f"Unknown doc retrieval model: {model!r} (expected 'bm25', 'bm25+rm3', or 'qld')"
+        f"Unknown doc retrieval model: {model!r} (expected 'bm25', 'bm25+rm3', 'qld', or 'qld+rm3')"
     )
 
 
