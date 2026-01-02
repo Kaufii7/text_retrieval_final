@@ -6,10 +6,11 @@ This PR ranks *extracted passages* in-memory (no Lucene index):
 
 Two modes:
 - global (default): score all passages across all documents for the query, then take top-k
-- per_doc: score passages *within each document only*, keep top-N per document, then merge and take top-k
+- per_doc: first filter passages within each document using a cheap heuristic, then score the
+  pooled candidate set globally (single DF/background model) so scores are comparable across docs.
 
-The per_doc mode avoids computing a single huge DF/background model over hundreds of thousands
-of passages, which can be very slow and memory-heavy.
+The per_doc mode avoids scoring hundreds of thousands of passages globally, while still preserving
+comparability of scores across documents by using a global DF/background model on the reduced pool.
 """
 
 from __future__ import annotations
@@ -54,9 +55,11 @@ def rank_passages(
     model = (model_cfg.get("model") or "bm25").lower()
 
     per_doc = bool(model_cfg.get("per_doc", False))
-    per_doc_topn = int(model_cfg.get("per_doc_topn", 3))
-    if per_doc_topn < 0:
-        per_doc_topn = 0
+    per_doc_filter = str(model_cfg.get("per_doc_filter", "overlap")).lower()  # overlap | first_k
+    # Backward-compat: if older config uses per_doc_topn, treat it as per_doc_filter_k
+    per_doc_filter_k = int(model_cfg.get("per_doc_filter_k", model_cfg.get("per_doc_topn", 5)))
+    if per_doc_filter_k < 0:
+        per_doc_filter_k = 0
 
     results_by_topic: Dict[int, List[Passage]] = {}
     total_passages = 0
@@ -107,38 +110,60 @@ def rank_passages(
             raise ValueError(f"Unknown passage retrieval model: {model!r}")
 
         if per_doc:
-            # Score within each document only; keep top-N per document; merge and globally sort.
+            if per_doc_filter_k == 0:
+                results_by_topic[q.id] = []
+                continue
+
             by_doc: Dict[str, List[Passage]] = defaultdict(list)
             for p in passages:
                 by_doc[p.document_id].append(p)
 
-            kept: List[tuple[float, Passage]] = []
-            if per_doc_topn > 0:
-                for _docid, ps in by_doc.items():
-                    if not ps:
-                        continue
+            q_set = set(q_terms)
 
-                    doc_tokens = [tokenize(p.content) for p in ps]
-                    df = compute_df(doc_tokens)
-                    bg = compute_bg_prob(doc_tokens)
-                    n_docs = len(doc_tokens)
-                    avgdl = sum(len(t) for t in doc_tokens) / float(n_docs) if n_docs else 0.0
+            pooled: List[tuple[Passage, List[str]]] = []
+            for _docid, ps in by_doc.items():
+                if not ps:
+                    continue
 
-                    scored_doc: List[tuple[float, Passage]] = []
-                    for p, toks in zip(ps, doc_tokens):
-                        tf = Counter(toks)
-                        dl = len(toks)
-                        s = _score_one(tf, dl, df=df, bg=bg, n_docs=n_docs, avgdl=avgdl)
-                        scored_doc.append((s, Passage(document_id=p.document_id, index=p.index, content=p.content, score=s)))
+                if per_doc_filter == "first_k":
+                    # Deterministic: keep earliest passages by index.
+                    ps_sorted = sorted(ps, key=lambda p: p.index)
+                    for p in ps_sorted[:per_doc_filter_k]:
+                        pooled.append((p, tokenize(p.content)))
+                elif per_doc_filter == "overlap":
+                    # Cheap heuristic: query term overlap count.
+                    scored_h: List[tuple[int, int, Passage, List[str]]] = []
+                    for p in ps:
+                        toks = tokenize(p.content)
+                        overlap = sum(1 for t in toks if t in q_set)
+                        scored_h.append((int(overlap), int(p.index), p, toks))
+                    scored_h.sort(key=lambda x: (-x[0], x[1]))
+                    for _overlap, _idx, p, toks in scored_h[:per_doc_filter_k]:
+                        pooled.append((p, toks))
+                else:
+                    raise ValueError(f"Unknown passage_retrieval.per_doc_filter: {per_doc_filter!r} (use overlap|first_k)")
 
-                    # deterministic: score desc, then passage index asc
-                    scored_doc.sort(key=lambda x: (-x[0], x[1].index))
-                    kept.extend(scored_doc[:per_doc_topn])
+            if not pooled:
+                results_by_topic[q.id] = []
+                continue
 
-            kept.sort(key=lambda x: (-x[0], x[1].document_id, x[1].index))
-            results_by_topic[q.id] = [p for _s, p in kept[:topk]]
+            pooled_tokens = [toks for _p, toks in pooled]
+            df = compute_df(pooled_tokens)
+            bg = compute_bg_prob(pooled_tokens)
+            n_docs = len(pooled_tokens)
+            avgdl = sum(len(t) for t in pooled_tokens) / float(n_docs) if n_docs else 0.0
+
+            scored: List[tuple[float, Passage]] = []
+            for p, toks in pooled:
+                tf = Counter(toks)
+                dl = len(toks)
+                s = _score_one(tf, dl, df=df, bg=bg, n_docs=n_docs, avgdl=avgdl)
+                scored.append((s, Passage(document_id=p.document_id, index=p.index, content=p.content, score=s)))
+
+            scored.sort(key=lambda x: (-x[0], x[1].document_id, x[1].index))
+            results_by_topic[q.id] = [p for _s, p in scored[:topk]]
         else:
-            # Original mode: score globally across all passages.
+            # Global mode: score across all passages.
             docs_tokens = [tokenize(p.content) for p in passages]
             df = compute_df(docs_tokens)
             bg = compute_bg_prob(docs_tokens)
@@ -157,7 +182,11 @@ def rank_passages(
 
     dt = time.perf_counter() - t0
     stage_str = f", stage={stage}" if stage else ""
-    mode_str = ", mode=per_doc" if per_doc else ", mode=global"
+    if per_doc:
+        mode_str = f", mode=per_doc(filter={per_doc_filter},k={per_doc_filter_k})"
+    else:
+        mode_str = ", mode=global"
+
     log.info(
         "Ranked passages locally for %d queries (topk=%d, model=%s, passages=%d%s%s) in %.2fs.",
         len(queries),

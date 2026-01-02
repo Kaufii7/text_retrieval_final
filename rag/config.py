@@ -28,7 +28,7 @@ def default_approach2_config() -> ApproachConfig:
             # - docs: BM25 + QLD(mu=1000)
             # - passages: BM25 + QLD(mu=1000) (requires a passage index)
             "doc_retrieval": {"model": "bm25", "qld_mu": 1000},
-            "passage_retrieval": {"model": "bm25", "qld_mu": 1000, "per_doc": True, "per_doc_topn": 20},
+            "passage_retrieval": {"model": "bm25", "qld_mu": 1000, "per_doc": True, "per_doc_filter": "overlap", "per_doc_filter_k": 10},
 
             # Passage extraction (based on `rag_system/passages.py`):
             "min_sentences": 3,
@@ -97,8 +97,10 @@ def default_approach2_config() -> ApproachConfig:
                 # If true, cluster scores come from RankSVM predictions.
                 # If false, cluster scores are derived from the cluster seed passage rank.
                 "use_svm_cluster_scores": True,
+                # Reciprocal-rank denominator offset (RRF-style): contribution = 1 / (rr_k + rank)
+                "rr_k": 100,
                 "max_passages_per_doc": 200,  # M
-                "lambda_min": 0.0,
+                "lambda_min": 0.5,
                 "lambda_max": 1.0,
             },
 

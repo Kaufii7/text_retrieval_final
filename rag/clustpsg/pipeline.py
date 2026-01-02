@@ -108,6 +108,7 @@ def _doc_scores_from_ranked_passages_rr(
     passages_ranked: Sequence[Passage],
     *,
     max_passages_per_doc: int,
+    rr_k: int = 0,
 ) -> tuple[Dict[str, float], Dict[str, int]]:
     """Sum reciprocal ranks of passages per document, capped to M passages per doc.
 
@@ -115,6 +116,8 @@ def _doc_scores_from_ranked_passages_rr(
     """
     if max_passages_per_doc <= 0:
         return {}, {}
+    if rr_k < 0:
+        rr_k = 0
     score: Dict[str, float] = {}
     used: Dict[str, int] = {}
     for r, p in enumerate(passages_ranked, start=1):
@@ -122,7 +125,7 @@ def _doc_scores_from_ranked_passages_rr(
         cnt = used.get(docid, 0)
         if cnt >= max_passages_per_doc:
             continue
-        score[docid] = score.get(docid, 0.0) + (1.0 / float(r))
+        score[docid] = score.get(docid, 0.0) + (1.0 / float(rr_k + r))
         used[docid] = cnt + 1
     return score, used
 
@@ -530,6 +533,7 @@ def clustpsg_run(
     max_passages_per_doc = int(final_cfg.get("max_passages_per_doc", 3))
     lambda_min = float(final_cfg.get("lambda_min", 0.2))
     lambda_max = float(final_cfg.get("lambda_max", 0.8))
+    rr_k = int(final_cfg.get("rr_k", 0))
 
     cluster_scores: Dict[Tuple[int, str], float] = {}
     if use_svm_cluster_scores:
@@ -579,6 +583,7 @@ def clustpsg_run(
         passage_rr, used_counts = _doc_scores_from_ranked_passages_rr(
             reranked_passages,
             max_passages_per_doc=max_passages_per_doc,
+            rr_k=rr_k,
         )
 
         # Score documents by adaptive fusion: lambda * passage_rr + (1-lambda) * bm25_rr
