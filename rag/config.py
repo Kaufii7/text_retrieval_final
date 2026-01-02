@@ -35,7 +35,7 @@ def default_approach2_config() -> ApproachConfig:
                 "b": 0.8, # Length normalization
                 # RM3 params (used by "bm25+rm3")
                 "rm3_fb_terms": 10,
-                "rm3_fb_docs": 10,
+                "rm3_fb_docs": 30,
                 "rm3_original_query_weight": 0.5,
                 # QLD param (used by "qld")
                 "qld_mu": 1000,
