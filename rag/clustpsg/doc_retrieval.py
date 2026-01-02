@@ -10,7 +10,7 @@ import logging
 from typing import Dict, List, Optional, Sequence
 
 from rag.config import ApproachConfig
-from rag.lucene_backend import SearchHit, search, set_bm25, set_qld
+from rag.lucene_backend import SearchHit, search, set_bm25, set_qld, set_rm3
 from rag.types import Document, Query
 
 
@@ -25,12 +25,33 @@ def _apply_doc_retrieval_model(searcher, cfg: ApproachConfig) -> None:
         set_bm25(searcher, k1=k1, b=b)
         return
 
+    if model in ("bm25+rm3", "bm25_rm3", "rm3"):
+        # BM25 first stage + RM3 pseudo-relevance feedback query expansion.
+        k1 = float(model_cfg.get("k1", 0.9))
+        b = float(model_cfg.get("b", 0.4))
+        set_bm25(searcher, k1=k1, b=b)
+
+        fb_terms = int(model_cfg.get("rm3_fb_terms", model_cfg.get("fb_terms", 10)))
+        fb_docs = int(model_cfg.get("rm3_fb_docs", model_cfg.get("fb_docs", 10)))
+        original_query_weight = float(
+            model_cfg.get("rm3_original_query_weight", model_cfg.get("original_query_weight", 0.5))
+        )
+        set_rm3(
+            searcher,
+            fb_terms=fb_terms,
+            fb_docs=fb_docs,
+            original_query_weight=original_query_weight,
+        )
+        return
+
     if model in ("qld", "ql", "dirichlet"):
         mu = float(model_cfg.get("qld_mu", 1000))
         set_qld(searcher, mu=mu)
         return
 
-    raise ValueError(f"Unknown doc retrieval model: {model!r} (expected 'bm25' or 'qld')")
+    raise ValueError(
+        f"Unknown doc retrieval model: {model!r} (expected 'bm25', 'bm25+rm3', or 'qld')"
+    )
 
 
 def retrieve_doc_candidates(

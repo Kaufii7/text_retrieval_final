@@ -54,6 +54,33 @@ def set_qld(searcher, mu: float) -> None:
     searcher.set_qld(mu)
 
 
+def set_rm3(
+    searcher,
+    *,
+    fb_terms: int = 10,
+    fb_docs: int = 10,
+    original_query_weight: float = 0.5,
+) -> None:
+    """Enable RM3 pseudo-relevance feedback on a LuceneSearcher.
+
+    Notes:
+    - RM3 is typically applied on top of a first-stage lexical retriever (e.g., BM25).
+    - Pyserini exposes RM3 via LuceneSearcher.set_rm3(...).
+    """
+    if not isinstance(fb_terms, int) or fb_terms <= 0:
+        raise ValueError("fb_terms must be a positive integer")
+    if not isinstance(fb_docs, int) or fb_docs <= 0:
+        raise ValueError("fb_docs must be a positive integer")
+    if not (0.0 <= float(original_query_weight) <= 1.0):
+        raise ValueError("original_query_weight must be in [0, 1]")
+
+    searcher.set_rm3(
+        fb_terms=int(fb_terms),
+        fb_docs=int(fb_docs),
+        original_query_weight=float(original_query_weight),
+    )
+
+
 def search(searcher, query: str, topk: int = 1000) -> List[SearchHit]:
     """Execute a search and normalize results.
 

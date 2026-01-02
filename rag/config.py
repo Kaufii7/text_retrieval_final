@@ -25,9 +25,21 @@ def default_approach2_config() -> ApproachConfig:
         name="clustpsg",
         params={
             # Retrieval models used inside clustpsg:
-            # - docs: BM25 + QLD(mu=1000)
+            # - docs: BM25, BM25+RM3, or QLD(mu=1000)
             # - passages: BM25 + QLD(mu=1000) (requires a passage index)
-            "doc_retrieval": {"model": "bm25", "qld_mu": 1000},
+            "doc_retrieval": {
+                # model: "bm25" | "bm25+rm3" | "qld"
+                "model": "bm25+rm3",
+                # BM25 params (used by "bm25" and "bm25+rm3")
+                "k1": 0.9,
+                "b": 0.4,
+                # RM3 params (used by "bm25+rm3")
+                "rm3_fb_terms": 10,
+                "rm3_fb_docs": 10,
+                "rm3_original_query_weight": 0.5,
+                # QLD param (used by "qld")
+                "qld_mu": 1000,
+            },
             "passage_retrieval": {"model": "bm25", "qld_mu": 1000, "per_doc": True, "per_doc_filter": "overlap", "per_doc_filter_k": 10},
 
             # Passage extraction (based on `rag_system/passages.py`):
