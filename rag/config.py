@@ -62,7 +62,7 @@ def default_approach2_config() -> ApproachConfig:
                     # Enable either by setting this flag, or by using model="lucene_bm25+rm3".
                     "rm3": {
                         "enabled": True,
-                        "fb_terms": 10,
+                        "fb_terms": 30,
                         "fb_docs": 10,
                         "original_query_weight": 0.5,
                     },
