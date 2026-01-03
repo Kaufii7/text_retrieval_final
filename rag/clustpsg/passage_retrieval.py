@@ -15,12 +15,20 @@ comparability of scores across documents by using a global DF/background model o
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
+import subprocess
+import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from rag.config import ApproachConfig
+from rag.lucene_backend import search as lucene_search
+from rag.lucene_backend import set_bm25 as lucene_set_bm25
 from rag.types import Passage, Query
 
 from rag.clustpsg.text_scoring import (
@@ -32,6 +40,122 @@ from rag.clustpsg.text_scoring import (
 )
 
 from rag.query_expansion import expand_query_terms_semantic
+
+
+
+def _passage_pid(p: Passage) -> str:
+    # Unique + reversible-ish id for mapping Lucene hits back to passages.
+    return f"{p.document_id}__p{int(p.index)}"
+
+
+def _fingerprint_passages(passages: Sequence[Passage]) -> str:
+    """Stable-ish fingerprint of a passage set (content-sensitive)."""
+    h = hashlib.sha256()
+    for p in passages:
+        h.update(str(p.document_id).encode("utf-8", "ignore"))
+        h.update(b"\0")
+        h.update(str(int(p.index)).encode("utf-8", "ignore"))
+        h.update(b"\0")
+        h.update((p.content or "").encode("utf-8", "ignore"))
+        h.update(b"\n")
+    return h.hexdigest()[:20]
+
+
+def _ensure_lucene_index_for_passages(
+    *,
+    passages: Sequence[Passage],
+    cache_dir: str,
+    mode: str,
+) -> Tuple[object, Optional[tempfile.TemporaryDirectory]]:
+    """Build a Lucene index over the given passages and return a LuceneSearcher.
+
+    Modes:
+      - \"temp\"  : build in a temporary directory (deleted after use)   [A]
+      - \"cache\" : build under cache_dir using a content fingerprint     [B]
+    """
+    from pyserini.search.lucene import LuceneSearcher
+
+    mode = str(mode or "cache").lower()
+    if mode not in ("temp", "cache"):
+        raise ValueError(f"Unknown passage_lucene.mode: {mode!r} (use 'temp' or 'cache')")
+
+    if mode == "temp":
+        tmp = tempfile.TemporaryDirectory(prefix="passage_lucene_")
+        base = tmp.name
+        collection_dir = os.path.join(base, "collection")
+        index_dir = os.path.join(base, "index")
+        os.makedirs(collection_dir, exist_ok=True)
+
+        jsonl_path = os.path.join(collection_dir, "passages.jsonl")
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for p in passages:
+                rec = {"id": _passage_pid(p), "contents": p.content}
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "pyserini.index.lucene",
+            "--collection",
+            "JsonCollection",
+            "--input",
+            collection_dir,
+            "--index",
+            index_dir,
+            "--generator",
+            "DefaultLuceneDocumentGenerator",
+            "--threads",
+            "1",
+            "--storeRaw",
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        return LuceneSearcher(index_dir), tmp
+
+    # mode == "cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    fp = _fingerprint_passages(passages)
+    base = os.path.join(cache_dir, f"qpassages_{fp}")
+    collection_dir = os.path.join(base, "collection")
+    index_dir = os.path.join(base, "index")
+    meta_path = os.path.join(base, "meta.json")
+
+    if not os.path.exists(index_dir):
+        os.makedirs(collection_dir, exist_ok=True)
+        os.makedirs(index_dir, exist_ok=True)
+
+        jsonl_path = os.path.join(collection_dir, "passages.jsonl")
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for p in passages:
+                rec = {"id": _passage_pid(p), "contents": p.content}
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "pyserini.index.lucene",
+            "--collection",
+            "JsonCollection",
+            "--input",
+            collection_dir,
+            "--index",
+            index_dir,
+            "--generator",
+            "DefaultLuceneDocumentGenerator",
+            "--threads",
+            "1",
+            "--storeRaw",
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+
+        meta = {"fingerprint": fp, "n_passages": int(len(passages))}
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2, sort_keys=True)
+        except OSError:
+            # Best-effort; index dir is the source of truth.
+            pass
+
+    return LuceneSearcher(index_dir), None
 
 
 def rank_passages(
@@ -76,6 +200,79 @@ def rank_passages(
         q_terms = tokenize(q.content)
 
         q_terms = expand_query_terms_semantic(query_terms=q_terms, cfg=config)
+        query_str = " ".join(q_terms)
+
+        if model in ("lucene_bm25", "pyserini_bm25"):
+            # Passage ranking via Pyserini BM25 over a per-query Lucene index.
+            lucene_cfg = (model_cfg.get("lucene") or {}) if isinstance(model_cfg.get("lucene"), dict) else {}
+            # (A) "temp" or (B) "cache" (default)
+            lucene_mode = str(lucene_cfg.get("mode", model_cfg.get("lucene_mode", "cache"))).lower()
+            lucene_cache_dir = str(lucene_cfg.get("cache_dir", model_cfg.get("lucene_cache_dir", "cache/passage_lucene")))
+            # Requirement-default: build the searcher over *all extracted passages per query*.
+            lucene_use_all = bool(lucene_cfg.get("use_all_passages", model_cfg.get("lucene_use_all_passages", True)))
+
+            candidate_passages = passages
+            if (not lucene_use_all) and per_doc:
+                if per_doc_filter_k == 0:
+                    results_by_topic[q.id] = []
+                    continue
+
+                by_doc: Dict[str, List[Passage]] = defaultdict(list)
+                for p in passages:
+                    by_doc[p.document_id].append(p)
+
+                q_set = set(q_terms)
+                pooled: List[tuple[Passage, List[str]]] = []
+                for _docid, ps in by_doc.items():
+                    if not ps:
+                        continue
+
+                    if per_doc_filter == "first_k":
+                        ps_sorted = sorted(ps, key=lambda p: p.index)
+                        for p in ps_sorted[:per_doc_filter_k]:
+                            pooled.append((p, tokenize(p.content)))
+                    elif per_doc_filter == "overlap":
+                        scored_h: List[tuple[int, int, Passage, List[str]]] = []
+                        for p in ps:
+                            toks = tokenize(p.content)
+                            overlap = sum(1 for t in toks if t in q_set)
+                            scored_h.append((int(overlap), int(p.index), p, toks))
+                        scored_h.sort(key=lambda x: (-x[0], x[1]))
+                        for _overlap, _idx, p, toks in scored_h[:per_doc_filter_k]:
+                            pooled.append((p, toks))
+                    else:
+                        raise ValueError(
+                            f"Unknown passage_retrieval.per_doc_filter: {per_doc_filter!r} (use overlap|first_k)"
+                        )
+
+                candidate_passages = [p for p, _toks in pooled]
+
+            pid_to_passage = {_passage_pid(p): p for p in candidate_passages}
+            if not pid_to_passage:
+                results_by_topic[q.id] = []
+                continue
+
+            searcher, tmp = _ensure_lucene_index_for_passages(
+                passages=candidate_passages, cache_dir=lucene_cache_dir, mode=lucene_mode
+            )
+            try:
+                k1 = float(model_cfg.get("k1", 0.9))
+                b = float(model_cfg.get("b", 0.4))
+                lucene_set_bm25(searcher, k1=k1, b=b)
+
+                hits = lucene_search(searcher, query_str, topk=topk)
+                out: List[Passage] = []
+                for h in hits:
+                    p0 = pid_to_passage.get(h.docid)
+                    if p0 is None:
+                        continue
+                    out.append(Passage(document_id=p0.document_id, index=p0.index, content=p0.content, score=float(h.score)))
+
+                results_by_topic[q.id] = out
+            finally:
+                if tmp is not None:
+                    tmp.cleanup()
+            continue
 
         def _score_one(tf: Counter, dl: int, *, df, bg, n_docs: int, avgdl: float) -> float:
             if model == "bm25":
@@ -192,7 +389,7 @@ def rank_passages(
         mode_str = ", mode=global"
 
     log.info(
-        "Ranked passages locally for %d queries (topk=%d, model=%s, passages=%d%s%s) in %.2fs.",
+        "Ranked passages for %d queries (topk=%d, model=%s, passages=%d%s%s) in %.2fs.",
         len(queries),
         topk,
         model,

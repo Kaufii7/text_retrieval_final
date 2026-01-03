@@ -40,7 +40,26 @@ def default_approach2_config() -> ApproachConfig:
                 # QLD param (used by "qld" and "qld+rm3")
                 "qld_mu": 1000,
             },
-            "passage_retrieval": {"model": "bm25", "qld_mu": 1000, "per_doc": True, "per_doc_filter": "overlap", "per_doc_filter_k": 10},
+            "passage_retrieval": {
+                # Passage ranking model: local bm25/qld OR Lucene BM25 over a per-query passage index.
+                "model": "lucene_bm25",
+                # BM25 params for lucene_bm25 or local bm25.
+                "k1": 0.9,
+                "b": 0.4,
+                # Optional speed/recall knobs (used if lucene_use_all_passages=False or for local scoring).
+                "per_doc": True,
+                "per_doc_filter": "overlap",
+                "per_doc_filter_k": 10,
+                # Choose between (A) and (B):
+                # - mode="temp"  => build a temporary per-query index each run (A)
+                # - mode="cache" => cache per-query passage indices on disk (B, default)
+                "lucene": {
+                    "mode": "cache",
+                    "cache_dir": "cache/passage_lucene",
+                    # Default per requirement: index all extracted passages for the query.
+                    "use_all_passages": True,
+                },
+            },
 
             # Conservative semantic query expansion (noun-only via curated synonym map).
             # Adds up to N extra terms per query to improve recall while limiting drift.

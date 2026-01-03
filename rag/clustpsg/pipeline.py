@@ -237,6 +237,11 @@ def clustpsg_run(
     log = logger or logging.getLogger("rag.clustpsg.pipeline")
     cfg = config or default_approach2_config()
     params = cfg.params or {}
+
+    # Control whether we build/train/load the RankSVM model.
+    # If disabled, we skip generating the cluster-level training dataset entirely.
+    final_cfg = (params.get("final") or {})
+    use_svm_cluster_scores = bool(final_cfg.get("use_svm_cluster_scores", True))
     t_run0 = time.perf_counter()
 
     cache_cfg = (params.get("passage_cache") or {})
@@ -440,96 +445,108 @@ def clustpsg_run(
         clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
     log.info("Stage(inference): clustered passages in %.2fs", time.perf_counter() - t0)
 
-    # 6) Build cluster-level instances:
+    # 6) Build cluster-level instances (only needed when scoring clusters with an SVM model):
     # - training instances come from the chosen training doc source
     # - inference instances come from retrieved candidates and do not need qrels
     train_instances: List = []
     feature_names: List[str] = []
-    if split == "train":
-        # Build a training pipeline over the training docs (can be cached)
-        if train_ranked_passages_by_topic is None:
-            t0 = time.perf_counter()
-            log.info("Stage(train): extracting passages (uncached)")
-            train_passages = passages_by_topic(train_docs_by_topic, cfg=cfg)
-            log.info("Stage(train): extracted passages in %.2fs", time.perf_counter() - t0)
-            train_ranked_passages = rank_passages(
-                queries=queries,
-                passages_by_topic=train_passages,
-                topk=clustering_max_passages,
-                config=cfg,
-                logger=log,
-                stage="train",
-            )
-            train_ranked_passages_by_topic = train_ranked_passages
-            if cache_enabled:
+    instances: List = []
+    m = None
+
+    if use_svm_cluster_scores:
+        if split == "train":
+            # Build a training pipeline over the training docs (can be cached)
+            if train_ranked_passages_by_topic is None:
                 t0 = time.perf_counter()
-                train_docids_for_cache = {tid: [d.id for d in train_docs_by_topic.get(tid, [])] for tid in sorted(train_docs_by_topic.keys())}
-                save_ranked_passages(
-                    cache_dir=cache_dir,
-                    stage="train",
+                log.info("Stage(train): extracting passages (uncached)")
+                train_passages = passages_by_topic(train_docs_by_topic, cfg=cfg)
+                log.info("Stage(train): extracted passages in %.2fs", time.perf_counter() - t0)
+                train_ranked_passages = rank_passages(
                     queries=queries,
-                    docids_by_topic=train_docids_for_cache,
+                    passages_by_topic=train_passages,
                     topk=clustering_max_passages,
-                    cfg=cfg,
-                    ranked_passages_by_topic=train_ranked_passages_by_topic,
+                    config=cfg,
+                    logger=log,
+                    stage="train",
                 )
-                log.info("Saved ranked passages cache (stage=train) in %.2fs", time.perf_counter() - t0)
-        else:
-            log.info("Stage(train): using cached ranked passages (no extraction/ranking)")
+                train_ranked_passages_by_topic = train_ranked_passages
+                if cache_enabled:
+                    t0 = time.perf_counter()
+                    train_docids_for_cache = {tid: [d.id for d in train_docs_by_topic.get(tid, [])] for tid in sorted(train_docs_by_topic.keys())}
+                    save_ranked_passages(
+                        cache_dir=cache_dir,
+                        stage="train",
+                        queries=queries,
+                        docids_by_topic=train_docids_for_cache,
+                        topk=clustering_max_passages,
+                        cfg=cfg,
+                        ranked_passages_by_topic=train_ranked_passages_by_topic,
+                    )
+                    log.info("Saved ranked passages cache (stage=train) in %.2fs", time.perf_counter() - t0)
+            else:
+                log.info("Stage(train): using cached ranked passages (no extraction/ranking)")
+
+            t0 = time.perf_counter()
+            log.info("Stage(train): clustering passages (topics=%d)", len(queries))
+            train_clusters_by_topic = {}
+            for q in queries:
+                plist = train_ranked_passages_by_topic.get(q.id, [])
+                train_clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
+            log.info("Stage(train): clustered passages in %.2fs", time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            log.info("Stage(train): building cluster-level training instances")
+            train_instances, feature_names = build_cluster_level_training_set(
+                queries=queries,
+                qrels=qrels,
+                doc_candidates_by_topic=train_docs_by_topic,
+                # Use retrieval candidates to define document rank features consistently with inference.
+                doc_rank_candidates_by_topic=doc_candidates_by_topic,
+                ranked_passages_by_topic=train_ranked_passages_by_topic,
+                clusters_by_topic=train_clusters_by_topic,
+                config=cfg,
+            )
+            log.info("Stage(train): built %d training instances in %.2fs", len(train_instances), time.perf_counter() - t0)
 
         t0 = time.perf_counter()
-        log.info("Stage(train): clustering passages (topics=%d)", len(queries))
-        train_clusters_by_topic = {}
-        for q in queries:
-            plist = train_ranked_passages_by_topic.get(q.id, [])
-            train_clusters_by_topic[q.id] = cluster_passages(plist, cfg=clustering_cfg)
-        log.info("Stage(train): clustered passages in %.2fs", time.perf_counter() - t0)
-
-        t0 = time.perf_counter()
-        log.info("Stage(train): building cluster-level training instances")
-        train_instances, feature_names = build_cluster_level_training_set(
+        log.info("Stage(inference): building cluster-level inference instances")
+        instances, _feature_names_infer = build_cluster_level_training_set(
             queries=queries,
-            qrels=qrels,
-            doc_candidates_by_topic=train_docs_by_topic,
-            # Use retrieval candidates to define document rank features consistently with inference.
-            doc_rank_candidates_by_topic=doc_candidates_by_topic,
-            ranked_passages_by_topic=train_ranked_passages_by_topic,
-            clusters_by_topic=train_clusters_by_topic,
+            qrels={},  # no labels needed for inference scoring
+            doc_candidates_by_topic=doc_candidates_by_topic,
+            ranked_passages_by_topic=ranked_passages_by_topic,
+            clusters_by_topic=clusters_by_topic,
             config=cfg,
         )
-        log.info("Stage(train): built %d training instances in %.2fs", len(train_instances), time.perf_counter() - t0)
+        log.info("Stage(inference): built %d inference instances in %.2fs", len(instances), time.perf_counter() - t0)
+        if not feature_names:
+            feature_names = _feature_names_infer
 
-    t0 = time.perf_counter()
-    log.info("Stage(inference): building cluster-level inference instances")
-    instances, _feature_names_infer = build_cluster_level_training_set(
-        queries=queries,
-        qrels={},  # no labels needed for inference scoring
-        doc_candidates_by_topic=doc_candidates_by_topic,
-        ranked_passages_by_topic=ranked_passages_by_topic,
-        clusters_by_topic=clusters_by_topic,
-        config=cfg,
-    )
-    log.info("Stage(inference): built %d inference instances in %.2fs", len(instances), time.perf_counter() - t0)
-    if not feature_names:
-        feature_names = _feature_names_infer
+        # 7) Train/load model
+        svm_cfg = (params.get("svm") or {})
+        model_path = str(svm_cfg.get("model_path", "models/clustpsg_svm.pkl"))
+        if split == "train" and train_model:
+            t0 = time.perf_counter()
+            log.info("Stage(train): training model (backend=%s)", str(svm_cfg.get("backend", "svm_rank")))
+            m = train_model_from_config(instances=train_instances, feature_names=feature_names, svm_cfg=svm_cfg)
+            save_model(m, model_path)
+            log.info(
+                "Saved clustpsg model metadata to %s (backend=%s) in %.2fs",
+                model_path,
+                m.model_type,
+                time.perf_counter() - t0,
+            )
 
-    # 7) Train/load model
-    svm_cfg = (params.get("svm") or {})
-    model_path = str(svm_cfg.get("model_path", "models/clustpsg_svm.pkl"))
-    if split == "train" and train_model:
         t0 = time.perf_counter()
-        log.info("Stage(train): training model (backend=%s)", str(svm_cfg.get("backend", "svm_rank")))
-        m = train_model_from_config(instances=train_instances, feature_names=feature_names, svm_cfg=svm_cfg)
-        save_model(m, model_path)
-        log.info("Saved clustpsg model metadata to %s (backend=%s) in %.2fs", model_path, m.model_type, time.perf_counter() - t0)
-    t0 = time.perf_counter()
-    log.info("Stage(inference): loading model from %s", model_path)
-    m = load_model(model_path)
-    log.info("Stage(inference): loaded model (backend=%s) in %.2fs", m.model_type, time.perf_counter() - t0)
+        log.info("Stage(inference): loading model from %s", model_path)
+        m = load_model(model_path)
+        log.info("Stage(inference): loaded model (backend=%s) in %.2fs", m.model_type, time.perf_counter() - t0)
+    else:
+        if split == "train":
+            log.info("Stage(train): skipping cluster-level training dataset/model (use_svm_cluster_scores=False)")
 
     # 8) Score clusters -> propagate to passages -> RRF -> doc scores
-    final_cfg = (params.get("final") or {})
-    use_svm_cluster_scores = bool(final_cfg.get("use_svm_cluster_scores", True))
+    # final_cfg and use_svm_cluster_scores were computed near the start of the run.
     max_passages_per_doc = int(final_cfg.get("max_passages_per_doc", 3))
     lambda_min = float(final_cfg.get("lambda_min", 0.2))
     lambda_max = float(final_cfg.get("lambda_max", 0.8))
