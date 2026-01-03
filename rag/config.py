@@ -86,8 +86,8 @@ def default_approach2_config() -> ApproachConfig:
 
             # Passage extraction (based on `rag_system/passages.py`):
             "min_sentences": 3,
-            "max_sentences": 5,
-            "stride_sentences": 2,
+            "max_sentences": 10,
+            "stride_sentences": 5,
             # Soft cap: do NOT truncate sentences; allow exceeding this to keep full sentences.
             "max_chars_per_sentence_soft": 300,
 
@@ -198,11 +198,11 @@ def default_approach2_config() -> ApproachConfig:
             },
 
             # PR8 pipeline limits (runtime control during development)
-            "doc_content_topk": 1000,
+            "doc_content_topk": 2000,
             # Fewer passages => much faster O(n^2) clustering
             "clustering_max_passages": 200,
             # Candidate generation depth for clustpsg (retrieve this many docs, then rerank, then output topk=1000).
-            "doc_candidates_depth": 2000,
+            "doc_candidates_depth": 5000,
 
             # Training-time: include *all* judged qrels docids as candidates, even if retrieval is top-k capped.
             "train_include_all_qrels_docs": True,
