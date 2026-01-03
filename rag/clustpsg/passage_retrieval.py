@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from rag.config import ApproachConfig
 from rag.lucene_backend import search as lucene_search
 from rag.lucene_backend import set_bm25 as lucene_set_bm25
+from rag.lucene_backend import set_rm3 as lucene_set_rm3
 from rag.types import Passage, Query
 
 from rag.clustpsg.text_scoring import (
@@ -107,6 +108,8 @@ def _ensure_lucene_index_for_passages(
             "--threads",
             "1",
             "--storeRaw",
+            "--storeDocvectors",
+            "--storePositions",
         ]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
         return LuceneSearcher(index_dir), tmp
@@ -114,7 +117,7 @@ def _ensure_lucene_index_for_passages(
     # mode == "cache"
     os.makedirs(cache_dir, exist_ok=True)
     fp = _fingerprint_passages(passages)
-    base = os.path.join(cache_dir, f"qpassages_{fp}")
+    base = os.path.join(cache_dir, f"qpassages_v2_{fp}")
     collection_dir = os.path.join(base, "collection")
     index_dir = os.path.join(base, "index")
     meta_path = os.path.join(base, "meta.json")
@@ -144,6 +147,8 @@ def _ensure_lucene_index_for_passages(
             "--threads",
             "1",
             "--storeRaw",
+            "--storeDocvectors",
+            "--storePositions",
         ]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
 
@@ -202,7 +207,7 @@ def rank_passages(
         q_terms = expand_query_terms_semantic(query_terms=q_terms, cfg=config)
         query_str = " ".join(q_terms)
 
-        if model in ("lucene_bm25", "pyserini_bm25"):
+        if model in ("lucene_bm25", "pyserini_bm25", "lucene_bm25+rm3", "lucene_bm25_rm3", "lucene_rm3"):
             # Passage ranking via Pyserini BM25 over a per-query Lucene index.
             lucene_cfg = (model_cfg.get("lucene") or {}) if isinstance(model_cfg.get("lucene"), dict) else {}
             # (A) "temp" or (B) "cache" (default)
@@ -259,6 +264,15 @@ def rank_passages(
                 k1 = float(model_cfg.get("k1", 0.9))
                 b = float(model_cfg.get("b", 0.4))
                 lucene_set_bm25(searcher, k1=k1, b=b)
+
+                # Optional: RM3 pseudo-relevance feedback over the passage index.
+                rm3_cfg = (lucene_cfg.get("rm3") or {}) if isinstance(lucene_cfg.get("rm3"), dict) else {}
+                rm3_enabled = bool(rm3_cfg.get("enabled", model in ("lucene_bm25+rm3", "lucene_bm25_rm3", "lucene_rm3")))
+                if rm3_enabled:
+                    fb_terms = int(rm3_cfg.get("fb_terms", model_cfg.get("rm3_fb_terms", 10)))
+                    fb_docs = int(rm3_cfg.get("fb_docs", model_cfg.get("rm3_fb_docs", 10)))
+                    oqw = float(rm3_cfg.get("original_query_weight", model_cfg.get("rm3_original_query_weight", 0.5)))
+                    lucene_set_rm3(searcher, fb_terms=fb_terms, fb_docs=fb_docs, original_query_weight=oqw)
 
                 hits = lucene_search(searcher, query_str, topk=topk)
                 out: List[Passage] = []

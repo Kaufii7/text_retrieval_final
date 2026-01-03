@@ -42,7 +42,7 @@ def default_approach2_config() -> ApproachConfig:
             },
             "passage_retrieval": {
                 # Passage ranking model: local bm25/qld OR Lucene BM25 over a per-query passage index.
-                "model": "lucene_bm25",
+                "model": "lucene_bm25+rm3",
                 # BM25 params for lucene_bm25 or local bm25.
                 "k1": 0.9,
                 "b": 0.4,
@@ -58,6 +58,14 @@ def default_approach2_config() -> ApproachConfig:
                     "cache_dir": "cache/passage_lucene",
                     # Default per requirement: index all extracted passages for the query.
                     "use_all_passages": True,
+                    # Optional: RM3 pseudo-relevance feedback over the passage index.
+                    # Enable either by setting this flag, or by using model="lucene_bm25+rm3".
+                    "rm3": {
+                        "enabled": True,
+                        "fb_terms": 10,
+                        "fb_docs": 10,
+                        "original_query_weight": 0.5,
+                    },
                 },
             },
 
