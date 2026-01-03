@@ -1,7 +1,0 @@
-{
-  "key": "2bc4a396ecd7f8fc365d",
-  "n_passages": 9917,
-  "n_topics": 50,
-  "stage": "inference",
-  "topk": 200
-}
