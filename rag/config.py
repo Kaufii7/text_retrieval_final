@@ -87,7 +87,7 @@ def default_approach2_config() -> ApproachConfig:
             # Passage extraction (based on `rag_system/passages.py`):
             "min_sentences": 3,
             "max_sentences": 10,
-            "stride_sentences": 5,
+            "stride_sentences": 2,
             # Soft cap: do NOT truncate sentences; allow exceeding this to keep full sentences.
             "max_chars_per_sentence_soft": 300,
 
