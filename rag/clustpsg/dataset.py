@@ -203,8 +203,39 @@ def build_cluster_level_training_set(
       docs -> passages -> clusters -> SVM (rank clusters) -> propagate to passages -> RRF -> docs
 
     Labels:
-      cluster label = 1 iff the cluster contains at least one passage whose source document
-      is relevant in qrels for this topic (rel >= label_rel_threshold).
+      Default ("any_relevant_doc"):
+        cluster label = 1 iff the cluster contains at least one passage whose source document
+        is relevant in qrels for this topic (rel >= label_rel_threshold).
+
+      Optional ("top_weighted_density"):
+        Compute a top-weighted relevance density of passages in the cluster:
+
+          density = sum_{p in cluster, rel(doc(p))=1} w(rank(p)) / sum_{p in cluster} w(rank(p))
+          w(r) = 1 / (rr_k + r)   where r is the global passage rank (1 = best)
+
+        Then bucket to an integer label for SVM^rank:
+          2 if density >= threshold_high
+          1 if density >= threshold_low
+          0 otherwise
+
+        Config (under cfg.params):
+          cluster_labeling.method: "any_relevant_doc" | "top_weighted_density"
+          cluster_labeling.rr_k: int (default: 0)
+          cluster_labeling.threshold_low: float (default: 0.10)
+          cluster_labeling.threshold_high: float (default: 0.30)
+
+      Optional ("best_evidence"):
+        Label a cluster by the *best* (highest-ranked) evidence it contains:
+        find best_rank = min global passage rank among passages in the cluster whose source doc is relevant.
+        Then bucket by rank thresholds:
+          2 if best_rank <= best_rank_high
+          1 if best_rank <= best_rank_low
+          0 otherwise (or if no relevant-doc passage exists in the cluster)
+
+        Config (under cfg.params):
+          cluster_labeling.method: "best_evidence"
+          cluster_labeling.best_rank_low: int (default: 100)
+          cluster_labeling.best_rank_high: int (default: 20)
 
     Notes:
     - We keep using `LTRInstance` for compatibility with existing SVM tooling. Here, `docid`
@@ -256,13 +287,95 @@ def build_cluster_level_training_set(
                 for i in cl.passage_indices
                 if 0 <= i < len(ranked_passages)
             }
+            # --- Cluster labeling (training supervision) ---
             label = 0
-            if qrels_topic and docs_in_cluster:
-                for docid in docs_in_cluster:
-                    rel = int(qrels_topic.get(docid, 0))
-                    if rel >= label_rel_threshold:
+            if qrels_topic and cl.passage_indices:
+                labeling_cfg = params.get("cluster_labeling", {}) or {}
+                method = str(labeling_cfg.get("method", "any_relevant_doc")).lower()
+
+                if method in ("any_relevant_doc", "any", "binary"):
+                    # Old behavior: if cluster touches any relevant doc -> positive.
+                    if docs_in_cluster:
+                        for docid in docs_in_cluster:
+                            rel = int(qrels_topic.get(docid, 0))
+                            if rel >= label_rel_threshold:
+                                label = 1
+                                break
+
+                elif method in ("top_weighted_density", "weighted_density", "top_weighted"):
+                    rr_k = int(labeling_cfg.get("rr_k", 0))
+                    if rr_k < 0:
+                        rr_k = 0
+                    thr_low = float(labeling_cfg.get("threshold_low", 0.10))
+                    thr_high = float(labeling_cfg.get("threshold_high", 0.30))
+                    if thr_low < 0.0:
+                        thr_low = 0.0
+                    if thr_high < thr_low:
+                        thr_high = thr_low
+
+                    num = 0.0
+                    den = 0.0
+                    for pi in cl.passage_indices:
+                        if not (0 <= pi < len(ranked_passages)):
+                            continue
+                        p = ranked_passages[pi]
+                        # passage_rank should map every passage, but fall back to list position if needed.
+                        r = int(passage_rank.get((p.document_id, p.index), pi + 1))
+                        if r <= 0:
+                            continue
+                        w = 1.0 / float(rr_k + r)
+                        den += w
+                        rel = int(qrels_topic.get(p.document_id, 0))
+                        if rel >= label_rel_threshold:
+                            num += w
+
+                    density = (num / den) if den > 0.0 else 0.0
+                    if density >= thr_high:
+                        label = 2
+                    elif density >= thr_low:
                         label = 1
-                        break
+                    else:
+                        label = 0
+
+                elif method in ("best_evidence", "best", "max_evidence"):
+                    best_rank_low = int(labeling_cfg.get("best_rank_low", 100))
+                    best_rank_high = int(labeling_cfg.get("best_rank_high", 20))
+                    if best_rank_low < 1:
+                        best_rank_low = 1
+                    if best_rank_high < 1:
+                        best_rank_high = 1
+                    # Ensure "high" is the stricter (smaller) threshold.
+                    if best_rank_high > best_rank_low:
+                        best_rank_high = best_rank_low
+
+                    best_rank = None
+                    for pi in cl.passage_indices:
+                        if not (0 <= pi < len(ranked_passages)):
+                            continue
+                        p = ranked_passages[pi]
+                        rel = int(qrels_topic.get(p.document_id, 0))
+                        if rel < label_rel_threshold:
+                            continue
+                        r = int(passage_rank.get((p.document_id, p.index), pi + 1))
+                        if r <= 0:
+                            continue
+                        if best_rank is None or r < best_rank:
+                            best_rank = r
+
+                    if best_rank is None:
+                        label = 0
+                    elif best_rank <= best_rank_high:
+                        label = 2
+                    elif best_rank <= best_rank_low:
+                        label = 1
+                    else:
+                        label = 0
+
+                else:
+                    raise ValueError(
+                        f"Unknown cluster_labeling.method: {method!r} "
+                        f"(use 'any_relevant_doc', 'top_weighted_density', or 'best_evidence')"
+                    )
 
             instances.append(
                 LTRInstance(

@@ -150,7 +150,7 @@ def default_approach2_config() -> ApproachConfig:
             "final": {
                 # If true, cluster scores come from RankSVM predictions.
                 # If false, cluster scores are derived from the cluster seed passage rank.
-                "use_svm_cluster_scores": False,
+                "use_svm_cluster_scores": True,
                 # Safety: blend RankSVM scores with the seed-heuristic cluster score
                 # to reduce degradation from noisy model predictions.
                 #
@@ -160,8 +160,8 @@ def default_approach2_config() -> ApproachConfig:
                     # alpha=0.0 => pure seed heuristic
                     "alpha": 0.5,
                     # Score normalization per topic before blending: none | zscore | minmax
-                    "svm_norm": "zscore",
-                    "seed_norm": "zscore",
+                    "svm_norm": "minmax",
+                    "seed_norm": "minmax",
                 },
                 # Reciprocal-rank denominator offset (RRF-style): contribution = 1 / (rr_k + rank)
                 "rr_k": 100,
@@ -185,6 +185,10 @@ def default_approach2_config() -> ApproachConfig:
                 "class_weight": "balanced",  # "balanced" | None
                 "max_iter": 5000,
                 "random_state": 42,
+                # RankSVM only: global feature normalization before writing svmrank_{train,test}.dat
+                # Use this to avoid feature-scale domination (e.g., counts overpowering RR features).
+                # Options: "none" | "minmax" | "zscore"
+                "svm_rank_feature_norm": "minmax",
                 # Metadata pickle (used by both backends)
                 "model_path": "models/clustpsg_svm.pkl",
 
@@ -212,7 +216,24 @@ def default_approach2_config() -> ApproachConfig:
             # Training doc source:
             # - "qrels": build training set from qrels docids only (fetched by docid)
             # - "retrieved": train from retrieved candidates (optionally augmented with qrels docids)
-            "train_docs_source": "qrels",
+            "train_docs_source": "retrieved",
+
+            # Cluster label supervision for RankSVM training (used by build_cluster_level_training_set):
+            # - "any_relevant_doc": label=1 if cluster contains ANY passage from a relevant qrels doc (binary, noisy)
+            # - "top_weighted_density": bucketed, top-heavy density of relevant-doc passages inside the cluster
+            #   density uses weights w(r)=1/(rr_k + r) where r is global passage rank (1=best).
+            "cluster_labeling": {
+                "method": "best_evidence",
+                # Only used for top_weighted_density:
+                "rr_k": 40,
+                "threshold_low": 0.10,
+                "threshold_high": 0.30,
+                # Only used for best_evidence:
+                # - label=2 if the best (lowest) relevant-doc passage rank in the cluster is <= best_rank_high
+                # - label=1 if <= best_rank_low
+                "best_rank_low": 100,
+                "best_rank_high": 20,
+            },
 
             # PR8 reranking control: keep clustpsg from wrecking a strong baseline.
             # - Only rerank within the top-N retrieved documents.
