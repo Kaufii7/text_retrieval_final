@@ -196,6 +196,7 @@ def build_cluster_level_training_set(
     ranked_passages_by_topic: Mapping[int, Sequence[Passage]],
     clusters_by_topic: Mapping[int, Sequence[Cluster]],
     config: ApproachConfig,
+    pseudo_relevant_passages_by_topic: Mapping[int, "set[tuple[str, int]]"] | None = None,
 ) -> Tuple[List[LTRInstance], List[str]]:
     """Build *cluster*-level training instances.
 
@@ -236,6 +237,23 @@ def build_cluster_level_training_set(
           cluster_labeling.method: "best_evidence"
           cluster_labeling.best_rank_low: int (default: 100)
           cluster_labeling.best_rank_high: int (default: 20)
+
+      Optional ("pseudo_passage_overlap"):
+        Training-only: label clusters using *pseudo-relevant passages* derived from qrels-relevant documents.
+
+        Expected input:
+          pseudo_relevant_passages_by_topic[topic_id] is a set of (docid, passage_index) pairs that were
+          marked as pseudo-relevant (e.g., top-k passages per relevant doc by Lucene BM25+RM3).
+
+        Labeling:
+          overlap = |{(docid, idx) in cluster} ∩ pseudo_relevant_passages_by_topic[topic_id]|
+          2 if overlap >= pseudo_overlap_high
+          1 if overlap >= pseudo_overlap_low
+          0 otherwise
+
+        Config (under cfg.params.cluster_labeling):
+          pseudo_overlap_low: int (default: 1)
+          pseudo_overlap_high: int (default: 2)
 
     Notes:
     - We keep using `LTRInstance` for compatibility with existing SVM tooling. Here, `docid`
@@ -371,10 +389,35 @@ def build_cluster_level_training_set(
                     else:
                         label = 0
 
+                elif method in ("pseudo_passage_overlap", "pseudo_overlap", "pseudo"):
+                    pseudo = (pseudo_relevant_passages_by_topic or {}).get(topic_id, set())
+                    low = int(labeling_cfg.get("pseudo_overlap_low", 1))
+                    high = int(labeling_cfg.get("pseudo_overlap_high", 2))
+                    if low < 1:
+                        low = 1
+                    if high < low:
+                        high = low
+
+                    overlap = 0
+                    if pseudo:
+                        for pi in cl.passage_indices:
+                            if not (0 <= pi < len(ranked_passages)):
+                                continue
+                            p = ranked_passages[pi]
+                            if (p.document_id, int(p.index)) in pseudo:
+                                overlap += 1
+
+                    if overlap >= high:
+                        label = 2
+                    elif overlap >= low:
+                        label = 1
+                    else:
+                        label = 0
+
                 else:
                     raise ValueError(
                         f"Unknown cluster_labeling.method: {method!r} "
-                        f"(use 'any_relevant_doc', 'top_weighted_density', or 'best_evidence')"
+                        f"(use 'any_relevant_doc', 'top_weighted_density', 'best_evidence', or 'pseudo_passage_overlap')"
                     )
 
             instances.append(

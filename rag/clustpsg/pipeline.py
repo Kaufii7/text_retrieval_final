@@ -18,7 +18,7 @@ import logging
 import json
 import math
 import time
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Set
 
 from rag.config import ApproachConfig, default_approach2_config
 from rag.clustpsg.cluster import Cluster, cluster_passages
@@ -182,6 +182,117 @@ def _fetch_doc_contents(searcher, docid: str) -> str:
             pass
 
     return raw
+
+
+def _build_pseudo_relevant_passages_for_training(
+    *,
+    queries: Sequence[Query],
+    searcher,
+    qrels: Mapping[int, Mapping[str, int]],
+    cfg: ApproachConfig,
+    logger: logging.Logger,
+) -> Dict[int, Set[tuple[str, int]]]:
+    """Build pseudo-relevant passages from qrels-relevant documents using Lucene BM25+RM3.
+
+    For each (topic, relevant docid):
+      1) extract passages from the document
+      2) build a temporary per-doc Lucene passage index
+      3) query it with BM25 (+ optional RM3) and take top-K passages for that doc
+
+    Returns:
+      dict[topic_id] -> set[(docid, passage_index)]
+    """
+    params = cfg.params or {}
+    label_rel_threshold = int(params.get("label_rel_threshold", 1))
+    labeling_cfg = (params.get("cluster_labeling") or {}) if isinstance(params.get("cluster_labeling"), dict) else {}
+    pseudo_cfg = (labeling_cfg.get("pseudo_lucene") or {}) if isinstance(labeling_cfg.get("pseudo_lucene"), dict) else {}
+    topk_per_doc = int(labeling_cfg.get("pseudo_topk_per_doc", 3))
+    if topk_per_doc < 1:
+        topk_per_doc = 1
+
+    # Lucene ranking params for pseudo-passages
+    lucene_mode = str(pseudo_cfg.get("mode", "temp")).lower()
+    lucene_cache_dir = str(pseudo_cfg.get("cache_dir", "cache/passage_lucene"))
+    k1 = float(pseudo_cfg.get("k1", 0.9))
+    b = float(pseudo_cfg.get("b", 0.4))
+    rm3_cfg = (pseudo_cfg.get("rm3") or {}) if isinstance(pseudo_cfg.get("rm3"), dict) else {}
+    rm3_enabled = bool(rm3_cfg.get("enabled", True))
+    rm3_fb_terms = int(rm3_cfg.get("fb_terms", 50))
+    rm3_fb_docs = int(rm3_cfg.get("fb_docs", 10))
+    rm3_oqw = float(rm3_cfg.get("original_query_weight", 0.2))
+
+    # Import internals from passage retrieval to ensure pid mapping matches.
+    from rag.clustpsg.passage_retrieval import _ensure_lucene_index_for_passages, _passage_pid  # type: ignore
+    from rag.lucene_backend import search as lucene_search
+    from rag.lucene_backend import set_bm25 as lucene_set_bm25
+    from rag.lucene_backend import set_rm3 as lucene_set_rm3
+    from rag.clustpsg.text_scoring import tokenize
+    from rag.query_expansion import expand_query_terms_semantic
+
+    out: Dict[int, Set[tuple[str, int]]] = {}
+
+    # Pre-map queries by id for deterministic traversal.
+    q_by_id = {q.id: q for q in queries}
+    for topic_id in sorted(q_by_id.keys()):
+        q = q_by_id[topic_id]
+        qrels_topic = qrels.get(topic_id, {}) or {}
+        rel_docids = [docid for docid, rel in qrels_topic.items() if int(rel) >= label_rel_threshold]
+        if not rel_docids:
+            out[topic_id] = set()
+            continue
+
+        # Fetch contents for relevant docs
+        rel_docs = [Document(id=docid, content=_fetch_doc_contents(searcher, docid), score=None) for docid in sorted(rel_docids)]
+        # Extract passages for relevant docs (topic-local)
+        rel_passages_by_topic = passages_by_topic({topic_id: rel_docs}, cfg=cfg)
+        rel_passages = list(rel_passages_by_topic.get(topic_id, []))
+        if not rel_passages:
+            out[topic_id] = set()
+            continue
+
+        # Build query string (match rank_passages behavior)
+        q_terms = tokenize(q.content)
+        q_terms = expand_query_terms_semantic(query_terms=q_terms, cfg=cfg)
+        query_str = " ".join(q_terms)
+
+        # Group passages per doc
+        by_doc: Dict[str, List[Passage]] = {}
+        for p in rel_passages:
+            by_doc.setdefault(p.document_id, []).append(p)
+
+        pseudo_set: Set[tuple[str, int]] = set()
+        for docid in sorted(by_doc.keys()):
+            ps = by_doc.get(docid, [])
+            if not ps:
+                continue
+
+            pid_to_passage = {_passage_pid(p): p for p in ps}
+            if not pid_to_passage:
+                continue
+
+            searcher_p, tmp = _ensure_lucene_index_for_passages(passages=ps, cache_dir=lucene_cache_dir, mode=lucene_mode)
+            try:
+                lucene_set_bm25(searcher_p, k1=k1, b=b)
+                if rm3_enabled:
+                    lucene_set_rm3(searcher_p, fb_terms=rm3_fb_terms, fb_docs=rm3_fb_docs, original_query_weight=rm3_oqw)
+                hits = lucene_search(searcher_p, query_str, topk=topk_per_doc)
+                for h in hits:
+                    p0 = pid_to_passage.get(h.docid)
+                    if p0 is None:
+                        continue
+                    pseudo_set.add((p0.document_id, int(p0.index)))
+            finally:
+                if tmp is not None:
+                    tmp.cleanup()
+
+        out[topic_id] = pseudo_set
+
+    logger.info(
+        "Pseudo passage supervision: built pseudo-relevant passage sets for %d topics (avg=%.2f passages/topic)",
+        len(out),
+        (sum(len(v) for v in out.values()) / float(len(out))) if out else 0.0,
+    )
+    return out
 
 
 def _with_contents(
@@ -496,6 +607,24 @@ def clustpsg_run(
 
             t0 = time.perf_counter()
             log.info("Stage(train): building cluster-level training instances")
+            # Optional: pseudo-supervision for clusters using Lucene BM25+RM3 top passages from qrels-relevant docs.
+            pseudo_relevant_passages_by_topic = None
+            try:
+                labeling_cfg = (params.get("cluster_labeling") or {}) if isinstance(params.get("cluster_labeling"), dict) else {}
+                labeling_method = str(labeling_cfg.get("method", "any_relevant_doc")).lower()
+            except Exception:
+                labeling_method = "any_relevant_doc"
+            if labeling_method in ("pseudo_passage_overlap", "pseudo_overlap", "pseudo"):
+                t_ps = time.perf_counter()
+                log.info("Stage(train): building pseudo-relevant passage supervision (method=%s)", labeling_method)
+                pseudo_relevant_passages_by_topic = _build_pseudo_relevant_passages_for_training(
+                    queries=queries,
+                    searcher=searcher,
+                    qrels=qrels,
+                    cfg=cfg,
+                    logger=log,
+                )
+                log.info("Stage(train): built pseudo passage supervision in %.2fs", time.perf_counter() - t_ps)
             train_instances, feature_names = build_cluster_level_training_set(
                 queries=queries,
                 qrels=qrels,
@@ -505,6 +634,7 @@ def clustpsg_run(
                 ranked_passages_by_topic=train_ranked_passages_by_topic,
                 clusters_by_topic=train_clusters_by_topic,
                 config=cfg,
+                pseudo_relevant_passages_by_topic=pseudo_relevant_passages_by_topic,
             )
             log.info("Stage(train): built %d training instances in %.2fs", len(train_instances), time.perf_counter() - t0)
 
@@ -517,6 +647,7 @@ def clustpsg_run(
             ranked_passages_by_topic=ranked_passages_by_topic,
             clusters_by_topic=clusters_by_topic,
             config=cfg,
+            pseudo_relevant_passages_by_topic=None,
         )
         log.info("Stage(inference): built %d inference instances in %.2fs", len(instances), time.perf_counter() - t0)
         if not feature_names:

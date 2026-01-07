@@ -223,16 +223,45 @@ def default_approach2_config() -> ApproachConfig:
             # - "top_weighted_density": bucketed, top-heavy density of relevant-doc passages inside the cluster
             #   density uses weights w(r)=1/(rr_k + r) where r is global passage rank (1=best).
             "cluster_labeling": {
-                "method": "best_evidence",
-                # Only used for top_weighted_density:
+                # Cluster label method (training only; inference uses label=0):
+                # - "any_relevant_doc": label=1 if cluster contains ANY passage from a relevant qrels doc (binary, noisy)
+                # - "top_weighted_density": top-heavy density of relevant-doc passages inside the cluster (bucketed 0/1/2)
+                # - "best_evidence": bucketed by the best (lowest) relevant-doc passage rank inside the cluster (0/1/2)
+                # - "pseudo_passage_overlap": build pseudo-relevant passages from qrels relevant docs using Lucene BM25+RM3,
+                #   then label clusters by overlap with those pseudo-relevant passages (0/1/2).
+                "method": "pseudo_passage_overlap",
+
+                # ---- top_weighted_density ----
                 "rr_k": 40,
                 "threshold_low": 0.10,
                 "threshold_high": 0.30,
-                # Only used for best_evidence:
-                # - label=2 if the best (lowest) relevant-doc passage rank in the cluster is <= best_rank_high
-                # - label=1 if <= best_rank_low
+
+                # ---- best_evidence ----
+                # label=2 if best_rank <= best_rank_high; label=1 if <= best_rank_low
                 "best_rank_low": 100,
                 "best_rank_high": 20,
+
+                # ---- pseudo_passage_overlap ----
+                # For each relevant qrels doc, mark its top-K passages (by Lucene BM25+RM3) as pseudo-relevant.
+                "pseudo_topk_per_doc": 3,
+                # How many overlaps with pseudo-relevant passages are needed for labels 1/2.
+                "pseudo_overlap_low": 1,
+                "pseudo_overlap_high": 2,
+                # Lucene settings for pseudo passage ranking (per-doc temporary passage index).
+                "pseudo_lucene": {
+                    "mode": "temp",  # temp | cache
+                    "cache_dir": "cache/passage_lucene",
+                    # BM25 parameters for the per-doc passage index.
+                    "k1": 0.9,
+                    "b": 0.4,
+                    # RM3 pseudo-relevance feedback over the per-doc passage index.
+                    "rm3": {
+                        "enabled": True,
+                        "fb_terms": 50,
+                        "fb_docs": 10,
+                        "original_query_weight": 0.2,
+                    },
+                },
             },
 
             # PR8 reranking control: keep clustpsg from wrecking a strong baseline.
