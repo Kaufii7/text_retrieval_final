@@ -331,6 +331,10 @@ def default_approach3_config() -> ApproachConfig:
             "rerank": {
                 "enabled": False,
                 "model_name": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                # If true, use `finetuned_model_dir` instead of `model_name`.
+                # This should point to a directory produced by A3-7 fine-tuning.
+                "use_finetuned": False,
+                "finetuned_model_dir": "models/approach3_ce/best",
                 "device": "cpu",
                 "batch_size": 16,
                 "topn": 100,

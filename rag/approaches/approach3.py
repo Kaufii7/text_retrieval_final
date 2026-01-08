@@ -123,7 +123,10 @@ def _rerank_with_cross_encoder(
     topn = int(_get_param(rerank_cfg, "topn", 100))
     if topn <= 0:
         return {}
-    model_name = str(_get_param(rerank_cfg, "model_name", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
+    use_finetuned = bool(_get_param(rerank_cfg, "use_finetuned", False))
+    finetuned_dir = str(_get_param(rerank_cfg, "finetuned_model_dir", "models/approach3_ce/best"))
+    base_model_name = str(_get_param(rerank_cfg, "model_name", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
+    model_name = finetuned_dir if use_finetuned else base_model_name
     device = str(_get_param(rerank_cfg, "device", "cpu"))
     batch_size = int(_get_param(rerank_cfg, "batch_size", 16))
 
