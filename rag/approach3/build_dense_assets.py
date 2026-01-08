@@ -47,35 +47,10 @@ def _ensure_dir(path: str) -> None:
 
 
 def _best_effort_doc_text(searcher, docid: str) -> str:
-    """Fetch best-effort document text (prefer contents(), then raw JSON->contents, else raw())."""
-    d = searcher.doc(docid)
-    if d is None:
-        return ""
+    """Backward-compatible wrapper (use rag.lucene_backend.fetch_doc_contents)."""
+    from rag.lucene_backend import fetch_doc_contents
 
-    # Prefer actual contents if available; raw() is often JSON and may include metadata.
-    try:
-        if hasattr(d, "contents"):
-            c = d.contents()
-            if c:
-                return c
-    except Exception:
-        pass
-
-    raw = ""
-    try:
-        raw = d.raw() or ""
-    except Exception:
-        raw = ""
-
-    if raw and raw.lstrip().startswith("{"):
-        try:
-            obj = json.loads(raw)
-            c = obj.get("contents") or obj.get("raw") or ""
-            if isinstance(c, str) and c:
-                return c
-        except Exception:
-            pass
-    return raw
+    return fetch_doc_contents(searcher, docid)
 
 
 def _iter_docids(index_name: str) -> Iterable[str]:

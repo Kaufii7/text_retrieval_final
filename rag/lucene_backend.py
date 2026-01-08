@@ -13,6 +13,7 @@ Expected usage:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import List, Optional
 
 
@@ -35,6 +36,46 @@ def get_index_reader(index_name: str = "robust04"):
     from pyserini.index.lucene import IndexReader
 
     return IndexReader.from_prebuilt_index(index_name)
+
+
+def fetch_doc_contents(searcher, docid: str) -> str:
+    """Best-effort raw content fetch for a document from a LuceneSearcher.
+
+    Preference order:
+    1) `doc.contents()` (when available)
+    2) `doc.raw()` parsed as JSON with `"contents"` (or `"raw"`) field
+    3) `doc.raw()` as-is
+    """
+    d = searcher.doc(docid)
+    if d is None:
+        return ""
+
+    # Prefer actual contents if available; raw() is often JSON and may include metadata.
+    try:
+        if hasattr(d, "contents"):
+            c = d.contents()
+            if c:
+                return c
+    except Exception:
+        pass
+
+    raw = ""
+    try:
+        raw = d.raw() or ""
+    except Exception:
+        raw = ""
+
+    # If raw looks like JSON with a "contents" field, extract it.
+    if raw and raw.lstrip().startswith("{"):
+        try:
+            obj = json.loads(raw)
+            c = obj.get("contents") or obj.get("raw") or ""
+            if isinstance(c, str) and c:
+                return c
+        except Exception:
+            pass
+
+    return raw
 
 
 def set_bm25(searcher, k1: float, b: float) -> None:

@@ -15,7 +15,6 @@ Pipeline (per query):
 from __future__ import annotations
 
 import logging
-import json
 import math
 import time
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Set
@@ -29,6 +28,7 @@ from rag.clustpsg.passage_cache import load_ranked_passages, save_ranked_passage
 from rag.clustpsg.passage_extraction import passages_by_topic
 from rag.clustpsg.passage_retrieval import rank_passages
 from rag.io import load_qrels
+from rag.lucene_backend import fetch_doc_contents
 from rag.training_utils import augment_candidates_with_qrels
 from rag.types import Document, Passage, Query
 
@@ -152,36 +152,8 @@ def _adaptive_lambda(*, used_passages: int, max_passages_per_doc: int, lambda_mi
 
 
 def _fetch_doc_contents(searcher, docid: str) -> str:
-    """Best-effort raw content fetch for passage extraction."""
-    d = searcher.doc(docid)
-    if d is None:
-        return ""
-    # Prefer actual contents if available; raw() is often JSON and is poor for sentence splitting.
-    try:
-        if hasattr(d, "contents"):
-            c = d.contents()
-            if c:
-                return c
-    except Exception:
-        pass
-
-    raw = ""
-    try:
-        raw = d.raw() or ""
-    except Exception:
-        raw = ""
-
-    # If raw looks like JSON with a "contents" field, extract it.
-    if raw and raw.lstrip().startswith("{"):
-        try:
-            obj = json.loads(raw)
-            c = obj.get("contents") or obj.get("raw") or ""
-            if isinstance(c, str) and c:
-                return c
-        except Exception:
-            pass
-
-    return raw
+    """Backward-compatible wrapper (use rag.lucene_backend.fetch_doc_contents)."""
+    return fetch_doc_contents(searcher, docid)
 
 
 def _build_pseudo_relevant_passages_for_training(
@@ -242,7 +214,7 @@ def _build_pseudo_relevant_passages_for_training(
             continue
 
         # Fetch contents for relevant docs
-        rel_docs = [Document(id=docid, content=_fetch_doc_contents(searcher, docid), score=None) for docid in sorted(rel_docids)]
+        rel_docs = [Document(id=docid, content=fetch_doc_contents(searcher, docid), score=None) for docid in sorted(rel_docids)]
         # Extract passages for relevant docs (topic-local)
         rel_passages_by_topic = passages_by_topic({topic_id: rel_docs}, cfg=cfg)
         rel_passages = list(rel_passages_by_topic.get(topic_id, []))
@@ -305,7 +277,7 @@ def _with_contents(
     for i, d in enumerate(docs):
         if i >= topk:
             break
-        out.append(Document(id=d.id, content=_fetch_doc_contents(searcher, d.id), score=d.score))
+        out.append(Document(id=d.id, content=fetch_doc_contents(searcher, d.id), score=d.score))
     return out
 
 
@@ -324,7 +296,7 @@ def _docs_from_qrels(
         docids = docids[: int(topk)]
     out: List[Document] = []
     for docid in docids:
-        out.append(Document(id=docid, content=_fetch_doc_contents(searcher, docid), score=None))
+        out.append(Document(id=docid, content=fetch_doc_contents(searcher, docid), score=None))
     return out
 
 
