@@ -10,8 +10,8 @@ set -euo pipefail
 # - zips them into submission.zip
 #
 # Note:
-# Approach2/3 are currently templates. Until they are implemented, this script
-# generates all three runs using BM25 with (optionally) different k1/b values.
+# Approach 3 is supported via `--approach approach3` (dense recall + optional rerank),
+# but it requires additional optional dependencies and cached artifacts.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${ROOT_DIR}/.venv/bin/python"
@@ -28,6 +28,14 @@ RUN2_K1="${RUN2_K1:-1.2}"
 RUN2_B="${RUN2_B:-0.4}"
 RUN3_K1="${RUN3_K1:-1.5}"
 RUN3_B="${RUN3_B:-0.4}"
+
+# Run 3 method:
+# - bm25 (default): BM25 baseline with RUN3_K1/RUN3_B
+# - approach3: dense recall (requires A3 assets); optional cross-encoder rerank via config
+RUN3_APPROACH="${RUN3_APPROACH:-bm25}"
+# Optional: pass an explicit Approach 3 config JSON for reproducibility.
+# See: configs/approach3_run3.example.json
+A3_CONFIG="${A3_CONFIG:-${ROOT_DIR}/configs/approach3_run3.example.json}"
 
 OUT1="${OUT1:-${ROOT_DIR}/run_1.res}"
 OUT2="${OUT2:-${ROOT_DIR}/run_2.res}"
@@ -48,10 +56,18 @@ echo "Generating run_2.res (BM25 k1=${RUN2_K1} b=${RUN2_B}) -> ${OUT2}"
   --k1 "${RUN2_K1}" --b "${RUN2_B}" \
   --output "${OUT2}" --run-tag run2
 
-echo "Generating run_3.res (BM25 k1=${RUN3_K1} b=${RUN3_B}) -> ${OUT3}"
-"${PY}" "${MAIN}" --approach bm25 --split "${SPLIT}" --queries "${QUERIES}" --topk "${TOPK}" \
-  --k1 "${RUN3_K1}" --b "${RUN3_B}" \
-  --output "${OUT3}" --run-tag run3
+if [[ "${RUN3_APPROACH}" == "approach3" ]]; then
+  echo "Generating run_3.res (Approach 3: dense recall -> optional rerank) -> ${OUT3}"
+  echo "  Using A3 config: ${A3_CONFIG}"
+  "${PY}" "${MAIN}" --approach approach3 --split "${SPLIT}" --queries "${QUERIES}" --topk "${TOPK}" \
+    --approach3-config "${A3_CONFIG}" \
+    --output "${OUT3}" --run-tag run3
+else
+  echo "Generating run_3.res (BM25 k1=${RUN3_K1} b=${RUN3_B}) -> ${OUT3}"
+  "${PY}" "${MAIN}" --approach bm25 --split "${SPLIT}" --queries "${QUERIES}" --topk "${TOPK}" \
+    --k1 "${RUN3_K1}" --b "${RUN3_B}" \
+    --output "${OUT3}" --run-tag run3
+fi
 
 echo "Packaging into ${ZIP_OUT}"
 rm -f "${ZIP_OUT}"

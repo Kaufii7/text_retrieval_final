@@ -19,7 +19,9 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional, Tuple
 
@@ -60,19 +62,118 @@ def _iter_docids(index_name: str) -> Iterable[str]:
     - We import Pyserini only inside this function to keep imports lightweight.
     - Docid order should be deterministic for a fixed index build.
     """
-    from rag.lucene_backend import get_index_reader
+    from rag.lucene_backend import get_index_reader, get_searcher
 
+    def _docid_from_lucene_document(doc) -> str:
+        # Common field names across Anserini/Pyserini collections
+        for k in ("id", "docid", "docno", "DOCNO"):
+            try:
+                v = doc.get(k)
+            except Exception:
+                v = None
+            if isinstance(v, str) and v:
+                return v
+        return ""
+
+    def _iter_from_java_reader(jreader) -> Iterable[str]:
+        # Lucene IndexReader-style iteration via internal doc ids.
+        try:
+            max_doc = int(jreader.maxDoc())
+        except Exception:
+            try:
+                max_doc = int(jreader.numDocs())
+            except Exception as e:
+                raise RuntimeError("Unable to determine maxDoc/numDocs from Lucene reader") from e
+
+        for i in range(max_doc):
+            try:
+                d = jreader.document(i)
+            except Exception:
+                # Some Lucene versions require storedFields().document(i)
+                try:
+                    sf = jreader.storedFields()
+                    d = sf.document(i)
+                except Exception:
+                    continue
+            docid = _docid_from_lucene_document(d)
+            if docid:
+                yield docid
+
+    def _iter_from_searcher(searcher) -> Iterable[str]:
+        # Anserini SimpleSearcher has numDocs() and doc(int internalId)
+        j = None
+        for attr in ("searcher", "_searcher", "simple_searcher", "_simple_searcher"):
+            if hasattr(searcher, attr):
+                j = getattr(searcher, attr)
+                if j is not None:
+                    break
+
+        # Try to get count
+        n = None
+        for cand in ("num_docs", "numDocs", "getNumDocs"):
+            try:
+                v = getattr(searcher, cand)
+                n = int(v() if callable(v) else v)
+                break
+            except Exception:
+                pass
+        if n is None and j is not None:
+            for cand in ("numDocs", "getNumDocs"):
+                try:
+                    n = int(getattr(j, cand)())
+                    break
+                except Exception:
+                    pass
+        if n is None:
+            # Last resort: use index reader iteration if we can obtain it
+            try:
+                r = j.getIndexReader() if j is not None and hasattr(j, "getIndexReader") else None
+            except Exception:
+                r = None
+            if r is not None:
+                yield from _iter_from_java_reader(r)
+                return
+            raise RuntimeError("Unable to iterate docids via LuceneSearcher (missing numDocs/doc APIs)")
+
+        for internal_id in range(int(n)):
+            if j is None:
+                # Try LuceneSearcher.doc(int) directly if exposed
+                try:
+                    d = searcher.doc(int(internal_id))
+                    docid = _docid_from_lucene_document(d)
+                    if docid:
+                        yield docid
+                    continue
+                except Exception:
+                    continue
+            try:
+                d = j.doc(int(internal_id))
+            except Exception:
+                # Some versions: document(int)
+                try:
+                    d = j.document(int(internal_id))
+                except Exception:
+                    continue
+            docid = _docid_from_lucene_document(d)
+            if docid:
+                yield docid
+
+    # 1) Try IndexReader convenience APIs (newer Pyserini)
     reader = get_index_reader(index_name)
-    # Pyserini IndexReader exposes docids() on recent versions.
     if hasattr(reader, "docids"):
         return reader.docids()
-    # Fallback: some versions may expose collection of docids under a different name.
     if hasattr(reader, "get_docids"):
         return reader.get_docids()
-    raise RuntimeError(
-        "Unable to iterate docids from Pyserini IndexReader. "
-        "Expected IndexReader.docids() to exist. Please update pyserini."
-    )
+
+    # 2) Try to access underlying Lucene reader if exposed on the wrapper
+    for attr in ("reader", "_reader", "index_reader", "_index_reader", "lucene_reader", "_lucene_reader"):
+        jreader = getattr(reader, attr, None)
+        if jreader is not None:
+            return _iter_from_java_reader(jreader)
+
+    # 3) Fallback: iterate via LuceneSearcher / SimpleSearcher internal docids (works on older installs)
+    searcher = get_searcher(index_name)
+    return _iter_from_searcher(searcher)
 
 
 @dataclass(frozen=True)
@@ -181,6 +282,9 @@ def build_embeddings_npy(
     device: str = "cpu",
     normalize_embeddings: bool = True,
     force: bool = False,
+    log_every: int = 5000,
+    show_progress_bar: bool = False,
+    logger: Optional[logging.Logger] = None,
 ) -> Tuple[int, int]:
     """Compute embeddings for the corpus JSONL and write a .npy matrix.
 
@@ -196,6 +300,8 @@ def build_embeddings_npy(
         except Exception:
             pass
 
+    log = logger or logging.getLogger("rag.approach3.build_dense_assets")
+
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore
     except Exception as e:
@@ -208,15 +314,25 @@ def build_embeddings_npy(
     from numpy.lib.format import open_memmap
 
     # First pass: count docs to allocate array deterministically.
+    t_count = time.perf_counter()
     num_docs = 0
     for _docid, _text in _iter_corpus_texts(corpus_jsonl):
         num_docs += 1
+    log.info("Embedding: counted %d docs in %.2fs", num_docs, time.perf_counter() - t_count)
 
     if num_docs <= 0:
         raise ValueError(f"No documents found in corpus: {corpus_jsonl}")
 
+    t_model = time.perf_counter()
     model = SentenceTransformer(model_name, device=device)
     dim = int(model.get_sentence_embedding_dimension())
+    log.info(
+        "Embedding: loaded model=%r device=%r dim=%d in %.2fs",
+        model_name,
+        device,
+        dim,
+        time.perf_counter() - t_model,
+    )
 
     _ensure_dir(os.path.dirname(out_embeddings_npy) or ".")
     tmp = out_embeddings_npy + ".tmp"
@@ -226,13 +342,15 @@ def build_embeddings_npy(
 
     buf_texts = []
     row = 0
+    last_log_row = 0
+    t0 = time.perf_counter()
     for _docid, text in _iter_corpus_texts(corpus_jsonl):
         buf_texts.append(text)
         if len(buf_texts) >= int(batch_size):
             emb = model.encode(
                 buf_texts,
                 batch_size=int(batch_size),
-                show_progress_bar=False,
+                show_progress_bar=bool(show_progress_bar),
                 convert_to_numpy=True,
                 normalize_embeddings=bool(normalize_embeddings),
             )
@@ -240,11 +358,27 @@ def build_embeddings_npy(
             row += int(emb.shape[0])
             buf_texts = []
 
+            if int(log_every) > 0 and (row - last_log_row) >= int(log_every):
+                elapsed = time.perf_counter() - t0
+                rate = (row / elapsed) if elapsed > 1e-9 else 0.0
+                remaining = max(0, num_docs - row)
+                eta = (remaining / rate) if rate > 1e-9 else float("inf")
+                log.info(
+                    "Embedding progress: %d/%d (%.1f%%) elapsed=%.1fs rate=%.1f docs/s eta=%.1fs",
+                    row,
+                    num_docs,
+                    100.0 * float(row) / float(num_docs),
+                    elapsed,
+                    rate,
+                    eta,
+                )
+                last_log_row = row
+
     if buf_texts:
         emb = model.encode(
             buf_texts,
             batch_size=int(batch_size),
-            show_progress_bar=False,
+            show_progress_bar=bool(show_progress_bar),
             convert_to_numpy=True,
             normalize_embeddings=bool(normalize_embeddings),
         )
@@ -254,6 +388,9 @@ def build_embeddings_npy(
     # Flush and atomically move into place.
     mmap.flush()
     os.replace(tmp, out_embeddings_npy)
+    elapsed = time.perf_counter() - t0
+    rate = (row / elapsed) if elapsed > 1e-9 else 0.0
+    log.info("Embedding: finished %d docs in %.2fs (%.1f docs/s)", row, elapsed, rate)
     return num_docs, dim
 
 
@@ -268,6 +405,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--device", default="cpu", help="Device for embedding model (cpu|cuda).")
     p.add_argument("--batch-size", type=int, default=64, help="Batch size for encoding.")
+    p.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, ...).")
+    p.add_argument("--log-every", type=int, default=5000, help="Log embedding progress every N documents.")
+    p.add_argument(
+        "--show-progress-bar",
+        action="store_true",
+        help="Let sentence-transformers show its own progress bar (may require extra deps).",
+    )
     p.add_argument(
         "--no-normalize",
         action="store_true",
@@ -290,6 +434,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    try:
+        from rag.logging_utils import configure_logging
+
+        configure_logging(args.log_level)
+    except Exception:
+        logging.basicConfig(level=str(args.log_level).upper())
+
     out_dir = str(args.out_dir)
     index_name = str(args.index)
     model_name = str(args.model_name)
@@ -317,6 +468,9 @@ def main() -> int:
             device=str(args.device),
             normalize_embeddings=not bool(args.no_normalize),
             force=bool(args.force),
+            log_every=int(args.log_every),
+            show_progress_bar=bool(args.show_progress_bar),
+            logger=logging.getLogger("rag.approach3.build_dense_assets"),
         )
 
     meta = {

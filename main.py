@@ -54,6 +54,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If --approach clustpsg, precompute and cache ranked passages (train/inference stages) and exit (no model needed).",
     )
+
+    # Approach 3 config (optional, for reproducibility)
+    p.add_argument(
+        "--approach3-config",
+        default=None,
+        help="Optional path to a JSON file describing ApproachConfig for --approach approach3.",
+    )
     return p
 
 
@@ -92,11 +99,16 @@ def main() -> int:
             return 0
         results_by_topic = {tid: [{"docid": docid, "score": score} for docid, score in pairs] for tid, pairs in run.items()}
     elif args.approach == "approach3":
+        cfg = None
+        if args.approach3_config:
+            from rag.config import load_approach_config_json
+
+            cfg = load_approach_config_json(args.approach3_config)
         results_by_topic = approach3_retrieve(
             queries=queries,
             searcher=searcher,
             topk=args.topk,
-            config=None,
+            config=cfg,
         )
     else:
         raise ValueError("Unknown approach: {0}".format(args.approach))

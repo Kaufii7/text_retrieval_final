@@ -6,6 +6,7 @@ approach parameters without forcing a heavyweight config system.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
@@ -17,6 +18,32 @@ class ApproachConfig:
     name: str
     params: Dict[str, Any] = field(default_factory=dict)
     candidates_depth: int | None = None
+
+
+def load_approach_config_json(path: str) -> ApproachConfig:
+    """Load an ApproachConfig from a JSON file.
+
+    Expected JSON keys:
+    - name: string
+    - params: object/dict (optional)
+    - candidates_depth: int|null (optional)
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError(f"{path}: expected a JSON object at top-level")
+    name = obj.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{path}: missing/invalid 'name'")
+    params = obj.get("params", {})
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise ValueError(f"{path}: 'params' must be a JSON object")
+    cd = obj.get("candidates_depth", None)
+    if cd is not None:
+        cd = int(cd)
+    return ApproachConfig(name=name, params=params, candidates_depth=cd)
 
 
 def default_approach2_config() -> ApproachConfig:

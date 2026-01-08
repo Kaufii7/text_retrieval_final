@@ -1,0 +1,33 @@
+{
+  "name": "approach3_dense_ce",
+  "candidates_depth": 2000,
+  "params": {
+    "dense": {
+      "index": "robust04",
+      "assets_dir": "cache/approach3_dense",
+      "embeddings_path": "cache/approach3_dense/embeddings_robust04__sentence-transformers_all-mpnet-base-v2.npy",
+      "docids_path": "cache/approach3_dense/docids_robust04.txt",
+      "metric": "cosine",
+      "backend": "hnswlib",
+      "hnsw_index_path": "cache/approach3_dense/hnsw_robust04__sentence-transformers_all-mpnet-base-v2.bin",
+      "hnsw_meta_path": "cache/approach3_dense/hnsw_robust04__sentence-transformers_all-mpnet-base-v2.meta.json",
+      "build_index_if_missing": true,
+      "hnsw": { "ef_construction": 200, "M": 16, "seed": 42, "ef": 200 },
+      "model_name": "sentence-transformers/all-mpnet-base-v2",
+      "device": "cpu",
+      "batch_size": 1,
+      "normalize_embeddings": true
+    },
+    "rerank": {
+      "enabled": false,
+      "model_name": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      "use_finetuned": false,
+      "finetuned_model_dir": "models/approach3_ce/best",
+      "device": "cpu",
+      "batch_size": 16,
+      "topn": 100
+    },
+    "score_fusion": { "alpha": 1.0 }
+  }
+}
+
