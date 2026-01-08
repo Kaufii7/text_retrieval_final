@@ -283,14 +283,63 @@ def default_approach2_config() -> ApproachConfig:
 
 
 def default_approach3_config() -> ApproachConfig:
-    """Default (placeholder) config for Approach 3."""
+    """Default config for Approach 3 (two-stage: dense recall -> optional CE rerank).
+
+    Notes:
+    - Dense assets (A3-1) are expected under `cache/approach3_dense/` by default.
+    - ANN index (A3-3) is cached to disk when enabled (hnswlib).
+    - Heavy ML deps are optional but required when running Approach 3:
+      - sentence-transformers (for query embedding; and for cross-encoder rerank if enabled)
+      - hnswlib (optional, for ANN; otherwise exact fallback is used)
+    """
+    # Keep defaults local and deterministic; filenames match A3-1/A3-3 helpers.
+    index_name = "robust04"
+    assets_dir = "cache/approach3_dense"
+    bi_encoder_model = "sentence-transformers/all-mpnet-base-v2"
+
+    safe_index = index_name.replace("/", "_")
+    safe_model = bi_encoder_model.replace("/", "_")
+    embeddings_path = f"{assets_dir}/embeddings_{safe_index}__{safe_model}.npy"
+    docids_path = f"{assets_dir}/docids_{safe_index}.txt"
+    hnsw_index_path = f"{assets_dir}/hnsw_{safe_index}__{safe_model}.bin"
+    hnsw_meta_path = f"{assets_dir}/hnsw_{safe_index}__{safe_model}.meta.json"
+
     return ApproachConfig(
-        name="approach3_template",
+        name="approach3_dense_ce",
         params={
-            # Put approach-specific knobs here (placeholder).
-            # Example: "rrf_k": 60
+            "dense": {
+                "index": index_name,
+                "assets_dir": assets_dir,
+                "embeddings_path": embeddings_path,
+                "docids_path": docids_path,
+                # Similarity metric used for dense retrieval (cosine recommended for normalized embeddings).
+                "metric": "cosine",  # cosine | ip | l2
+                # Retrieval backend: try hnswlib (fast ANN) and fall back to exact if unavailable.
+                "backend": "hnswlib",  # hnswlib | exact
+                # HNSW cache paths
+                "hnsw_index_path": hnsw_index_path,
+                "hnsw_meta_path": hnsw_meta_path,
+                # If the HNSW cache is missing, build it once and cache it (requires hnswlib).
+                "build_index_if_missing": True,
+                "hnsw": {"ef_construction": 200, "M": 16, "seed": 42, "ef": 200},
+                # Query encoder
+                "model_name": bi_encoder_model,
+                "device": "cpu",
+                "batch_size": 1,
+                "normalize_embeddings": True,
+            },
+            "rerank": {
+                "enabled": False,
+                "model_name": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                "device": "cpu",
+                "batch_size": 16,
+                "topn": 100,
+            },
+            # Final scoring policy for reranked docs:
+            # final = alpha * ce + (1-alpha) * dense_score
+            "score_fusion": {"alpha": 1.0},
         },
-        # For multi-stage methods, candidates_depth is often > topk (e.g., 2000-5000).
+        # Stage-1 candidates depth (often > topk).
         candidates_depth=2000,
     )
 

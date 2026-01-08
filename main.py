@@ -5,6 +5,7 @@ import logging
 from typing import List
 
 from rag.approaches.approach1 import bm25_retrieve
+from rag.approaches.approach3 import approach3_retrieve
 from rag.clustpsg.pipeline import clustpsg_run
 from rag.eval import load_trec_run, mean_average_precision
 from rag.io import Query, load_queries
@@ -19,14 +20,13 @@ def _split_queries(queries: List[Query], split: str, train_topics: int = 50) -> 
     if split == "train":
         return queries[:train_topics]
     if split == "test":
-        # return queries[train_topics:]
-        return queries[:train_topics]
+        return queries[train_topics:]
     raise ValueError("Unknown split: {0}".format(split))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="ROBUST04 retrieval runner (Pyserini).")
-    p.add_argument("--approach", choices=["bm25", "clustpsg"], default="bm25")
+    p.add_argument("--approach", choices=["bm25", "clustpsg", "approach3"], default="bm25")
     p.add_argument("--split", choices=["train", "test", "all"], default="test")
     p.add_argument("--queries", default="queriesROBUST.txt", help="Path to queries file.")
     p.add_argument("--output", required=True, help="Output run file path (TREC format).")
@@ -91,6 +91,13 @@ def main() -> int:
             log.info("Precomputed ranked passages cache. Exiting as requested by --precompute-passages.")
             return 0
         results_by_topic = {tid: [{"docid": docid, "score": score} for docid, score in pairs] for tid, pairs in run.items()}
+    elif args.approach == "approach3":
+        results_by_topic = approach3_retrieve(
+            queries=queries,
+            searcher=searcher,
+            topk=args.topk,
+            config=None,
+        )
     else:
         raise ValueError("Unknown approach: {0}".format(args.approach))
 
