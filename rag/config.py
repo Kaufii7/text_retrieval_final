@@ -354,6 +354,25 @@ def default_approach3_config() -> ApproachConfig:
                 "device": "cpu",
                 "batch_size": 1,
                 "normalize_embeddings": True,
+                # SageMaker endpoint configuration (optional)
+                # If enabled, uses AWS SageMaker endpoint instead of local SentenceTransformer
+                "sagemaker": {
+                    "enabled": False,
+                    # Endpoint name (e.g., "huggingface-pytorch-inference-2026-01-08-22-55-12-681")
+                    "endpoint_name": None,
+                    # AWS region (defaults to eu-north-1 if not specified)
+                    "region": "eu-north-1",
+                    # Maximum batch size for SageMaker requests (smaller is safer, default: 8)
+                    # Reduce if you encounter CUDA errors
+                    "max_batch_size": 8,
+                    # Maximum text length in characters (default: 400, reduce if CUDA errors persist)
+                    # Very long texts can cause CUDA device-side assertions
+                    "max_text_length": 400,
+                    # Fallback to local model if SageMaker fails (default: True for safety)
+                    # If True, will automatically use local SentenceTransformer if SageMaker endpoint fails
+                    # This allows processing to continue even if the endpoint has issues
+                    "fallback_to_local": True,
+                },
             },
             "rerank": {
                 "enabled": False,

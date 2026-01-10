@@ -81,9 +81,18 @@ def build_hnswlib_index(
 
     try:
         import hnswlib  # type: ignore
+        if not hasattr(hnswlib, "Index"):
+            raise ImportError(
+                "Imported 'hnswlib' but it has no attribute 'Index' (likely the local ./hnswlib/ directory shadowed it)."
+            )
     except Exception as e:
         raise RuntimeError(
-            "Missing dependency for ANN backend 'hnswlib'. Install hnswlib to build the ANN index."
+            "Missing dependency for ANN backend 'hnswlib' (or imported the local ./hnswlib/ source directory).\n"
+            "Install into the same environment you're running:\n"
+            "  ./.venv/bin/python -m pip install --no-build-isolation --no-deps ./hnswlib\n"
+            "On macOS if import fails with '__hash_memory' symbol, patch the built .so:\n"
+            "  install_name_tool -change /usr/lib/libc++.1.dylib /opt/homebrew/opt/llvm/lib/c++/libc++.1.dylib "
+            "$(./.venv/bin/python -c \"import hnswlib; print(hnswlib.__file__)\")\n"
         ) from e
 
     import numpy as np
@@ -114,6 +123,10 @@ def load_hnswlib_index(*, index_path: str, dim: int, space: str = "ip"):
     """Load a HNSWlib index from disk."""
     try:
         import hnswlib  # type: ignore
+        if not hasattr(hnswlib, "Index"):
+            raise ImportError(
+                "Imported 'hnswlib' but it has no attribute 'Index' (likely the local ./hnswlib/ directory shadowed it)."
+            )
     except Exception as e:
         raise RuntimeError("Missing dependency for ANN backend 'hnswlib'.") from e
 

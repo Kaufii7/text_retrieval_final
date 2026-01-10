@@ -79,3 +79,61 @@ def write_trec_run(
         f.writelines(lines)
 
 
+def load_trec_run_topic_ids(path: str) -> List[int]:
+    """Read the set of topic_ids present in a TREC run file (best-effort).
+
+    This is used for resume logic (skip already-written topics).
+    """
+    seen = set()
+    out: List[int] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                topic_id = int(parts[0])
+            except Exception:
+                continue
+            if topic_id not in seen:
+                seen.add(topic_id)
+                out.append(topic_id)
+    out.sort()
+    return out
+
+
+def append_trec_run_topic(
+    *,
+    output_path: str,
+    topic_id: int,
+    entries: Sequence[ResultLike],
+    run_tag: str,
+    topk: int = 1000,
+) -> None:
+    """Append a single topic's results to a TREC run file."""
+    if not isinstance(run_tag, str) or not run_tag.strip():
+        raise ValueError("run_tag must be a non-empty string")
+    if not isinstance(topk, int) or topk <= 0:
+        raise ValueError("topk must be a positive integer")
+
+    normalized: List[Tuple[str, float]] = []
+    for entry in entries:
+        docid, score = _normalize_entry(entry)
+        if not docid or any(ch.isspace() for ch in docid):
+            raise ValueError(f"Invalid docid for topic_id={topic_id}: {docid!r}")
+        normalized.append((docid, score))
+
+    normalized.sort(key=lambda x: (-x[1], x[0]))
+    normalized = normalized[:topk]
+
+    lines: List[str] = []
+    for rank, (docid, score) in enumerate(normalized, start=1):
+        lines.append(f"{int(topic_id)} Q0 {docid} {rank} {score:.6f} {run_tag}\n")
+
+    with open(output_path, "a", encoding="utf-8") as f:
+        f.writelines(lines)
+
+

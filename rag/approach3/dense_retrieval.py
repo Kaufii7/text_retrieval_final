@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -37,16 +38,36 @@ class DenseRetrieveConfig:
     ef: Optional[int] = None
 
 
-def embed_query(*, query: str, model_name: str, device: str, normalize_embeddings: bool):
-    try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Missing dependency for dense retrieval: sentence-transformers. "
-            "Install it to embed queries."
-        ) from e
+def embed_query(
+    *,
+    query: str,
+    model_name: str,
+    device: str,
+    normalize_embeddings: bool,
+    sagemaker_config: Optional[dict] = None,
+):
+    """Embed a query using either local SentenceTransformer or SageMaker endpoint.
 
-    model = SentenceTransformer(model_name, device=device)
+    Args:
+        query: Query string to embed
+        model_name: Model name (for local SentenceTransformer)
+        device: Device for local model (ignored for SageMaker)
+        normalize_embeddings: Whether to normalize embeddings
+        sagemaker_config: Optional dict with SageMaker config:
+            - enabled: bool
+            - endpoint_name: str
+            - region: str (optional)
+
+    Returns:
+        numpy array of embedding vector
+    """
+    from rag.approach3.sagemaker_embeddings import get_embedding_model
+
+    model = get_embedding_model(
+        model_name=model_name,
+        device=device,
+        sagemaker_config=sagemaker_config,
+    )
     vec = model.encode(
         [query],
         batch_size=1,
@@ -63,12 +84,14 @@ def retrieve_dense(
     index: DenseIndex,
     cfg: DenseRetrieveConfig,
     topk: int,
+    sagemaker_config: Optional[dict] = None,
 ) -> List[Tuple[str, float]]:
     qvec = embed_query(
         query=query,
         model_name=cfg.model_name,
         device=cfg.device,
         normalize_embeddings=cfg.normalize_embeddings,
+        sagemaker_config=sagemaker_config,
     )
     return index.search(qvec, topk=int(topk), ef=cfg.ef)
 
@@ -99,6 +122,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--M", type=int, default=16, help="HNSW M parameter.")
     p.add_argument("--seed", type=int, default=42, help="Seed for HNSW build (if supported).")
     p.add_argument("--rebuild-index", action="store_true", help="Force rebuild HNSW index.")
+    # SageMaker options
+    p.add_argument(
+        "--sagemaker-endpoint",
+        type=str,
+        default=None,
+        help="Use SageMaker endpoint instead of local model (provide endpoint name).",
+    )
+    p.add_argument(
+        "--sagemaker-region",
+        type=str,
+        default="eu-north-1",
+        help="AWS region for SageMaker endpoint (default: eu-north-1).",
+    )
     return p
 
 
@@ -123,23 +159,53 @@ def main() -> int:
         else:
             hnsw_index = str(args.hnsw_index)
             hnsw_meta = str(args.hnsw_meta)
-            if (not args.rebuild_index) and os.path.exists(hnsw_index) and os.path.exists(hnsw_meta):
-                index = load_hnsw_index(hnsw_meta)
-            else:
-                build_hnsw_index(
+            try:
+                if (not args.rebuild_index) and os.path.exists(hnsw_index) and os.path.exists(hnsw_meta):
+                    index = load_hnsw_index(hnsw_meta)
+                else:
+                    build_hnsw_index(
+                        embeddings_path=str(args.embeddings),
+                        docids_path=str(args.docids),
+                        out_index_path=hnsw_index,
+                        out_meta_path=hnsw_meta,
+                        metric=cfg.metric,
+                        ef_construction=int(args.ef_construction),
+                        M=int(args.M),
+                        seed=int(args.seed),
+                        force=bool(args.rebuild_index),
+                    )
+                    index = load_hnsw_index(hnsw_meta)
+            except Exception as e:
+                # Keep the CLI usable even if hnswlib isn't available / can't load.
+                # (This happens on some macOS toolchains with binary extensions.)
+                print(
+                    "WARNING: Failed to build/load HNSW index; falling back to exact search.\n"
+                    f"Reason: {e}\n"
+                    "To silence this warning, run with `--backend exact`.\n",
+                    file=sys.stderr,
+                )
+                index = load_exact_index(
                     embeddings_path=str(args.embeddings),
                     docids_path=str(args.docids),
-                    out_index_path=hnsw_index,
-                    out_meta_path=hnsw_meta,
                     metric=cfg.metric,
-                    ef_construction=int(args.ef_construction),
-                    M=int(args.M),
-                    seed=int(args.seed),
-                    force=bool(args.rebuild_index),
                 )
-                index = load_hnsw_index(hnsw_meta)
 
-    results = retrieve_dense(query=str(args.query), index=index, cfg=cfg, topk=int(args.topk))
+    # Build SageMaker config if endpoint is provided
+    sagemaker_config = None
+    if args.sagemaker_endpoint:
+        sagemaker_config = {
+            "enabled": True,
+            "endpoint_name": str(args.sagemaker_endpoint),
+            "region": str(args.sagemaker_region),
+        }
+
+    results = retrieve_dense(
+        query=str(args.query),
+        index=index,
+        cfg=cfg,
+        topk=int(args.topk),
+        sagemaker_config=sagemaker_config,
+    )
     for rank, (docid, score) in enumerate(results, start=1):
         print(f"{rank}\t{docid}\t{score:.6f}")
     return 0

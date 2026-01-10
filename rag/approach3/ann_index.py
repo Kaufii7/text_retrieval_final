@@ -13,7 +13,9 @@ without them unless this module is explicitly used.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -78,21 +80,62 @@ def build_hnsw_index(
     M: int = 16,
     seed: int = 42,
     force: bool = False,
+    add_batch_size: int = 200_000,
+    logger: Optional[logging.Logger] = None,
 ) -> AnnIndexMeta:
     """Build and persist an hnswlib index aligned with docids file order."""
+    log = logger or logging.getLogger(__name__)
     if (not force) and os.path.exists(out_index_path) and os.path.exists(out_meta_path):
+        log.info("HNSW: using existing index=%s meta=%s", out_index_path, out_meta_path)
         return load_index_meta(out_meta_path)
 
     try:
         import hnswlib  # type: ignore
+        if not hasattr(hnswlib, "Index"):
+            # Common pitfall: running from repo root without hnswlib installed causes
+            # `import hnswlib` to resolve to the local `./hnswlib/` source directory
+            # (a namespace package) instead of the compiled extension.
+            raise ImportError(
+                "Imported 'hnswlib' but it has no attribute 'Index' (likely the local ./hnswlib/ "
+                "directory shadowed the compiled package)."
+            )
     except Exception as e:
-        raise RuntimeError(
-            "Missing optional dependency: hnswlib. Install it to build an ANN index, "
-            "or use the exact fallback."
-        ) from e
+        # NOTE: On macOS it's common to see an ImportError from dlopen (binary incompat)
+        # even when `pip install hnswlib` succeeded. Preserve the original error so the
+        # user can act on it.
+        msg = (
+            "Unable to import optional dependency 'hnswlib'.\n\n"
+            "This is required to build/load the persistent ANN index.\n"
+            "If you're running from the repo root, make sure hnswlib is installed in the SAME Python "
+            "environment you are using (prefer the project's .venv).\n\n"
+            "If you see a dlopen/symbol-not-found error, it usually means the compiled "
+            "extension is binary-incompatible with your Python / toolchain.\n\n"
+            "Fix options:\n"
+            "- Use the project venv python:\n"
+            "    ./.venv/bin/python -m pip install --no-build-isolation --no-deps ./hnswlib\n"
+            "- If import fails on macOS with '__hash_memory' symbol:\n"
+            "    install_name_tool -change /usr/lib/libc++.1.dylib /opt/homebrew/opt/llvm/lib/c++/libc++.1.dylib "
+            "$(./.venv/bin/python -c \"import hnswlib; print(hnswlib.__file__)\")\n"
+            "- Or switch to the exact fallback backend (slower): --backend exact\n\n"
+            f"Original import error: {e!r}"
+        )
+        raise RuntimeError(msg) from e
 
     import numpy as np
 
+    t0 = time.perf_counter()
+    log.info(
+        "HNSW: build start metric=%s ef_construction=%d M=%d seed=%d batch=%s",
+        str(metric),
+        int(ef_construction),
+        int(M),
+        int(seed),
+        str(add_batch_size),
+    )
+    log.info("HNSW: inputs embeddings=%s docids=%s", embeddings_path, docids_path)
+    log.info("HNSW: outputs index=%s meta=%s", out_index_path, out_meta_path)
+
+    t_load = time.perf_counter()
     emb = load_embeddings(embeddings_path)
     docids = load_docids(docids_path)
     if int(emb.shape[0]) != len(docids):
@@ -101,29 +144,74 @@ def build_hnsw_index(
         )
     dim = int(emb.shape[1])
     n = int(emb.shape[0])
+    log.info(
+        "HNSW: loaded embeddings shape=(%d,%d) dtype=%s docs=%d in %.2fs",
+        n,
+        dim,
+        str(getattr(emb, "dtype", "?")),
+        len(docids),
+        time.perf_counter() - t_load,
+    )
 
     _ensure_dir(os.path.dirname(out_index_path) or ".")
-
-    # hnswlib expects contiguous float32
-    data = np.asarray(emb, dtype="float32")
 
     # If metric is cosine, normalize and use inner product.
     m = str(metric).lower()
     if m == "cosine":
-        data = _l2_normalize_rows(data)
         hnsw_metric = "ip"
     else:
         hnsw_metric = m
+    log.info("HNSW: effective space=%s (metric=%s)", str(hnsw_metric), str(metric))
 
     p = hnswlib.Index(space=hnsw_metric, dim=dim)
+    t_init = time.perf_counter()
     p.init_index(max_elements=n, ef_construction=int(ef_construction), M=int(M))
     if hasattr(p, "set_seed"):
         p.set_seed(int(seed))
-    p.add_items(data, list(range(n)))
+    log.info("HNSW: init_index done in %.2fs", time.perf_counter() - t_init)
+
+    # Build with progress logging.
+    t_add0 = time.perf_counter()
+    batch = int(add_batch_size)
+    if batch <= 0 or batch >= n:
+        log.info("HNSW: add_items start (single batch) n=%d", n)
+        data0 = np.asarray(emb, dtype="float32")
+        if m == "cosine":
+            data0 = _l2_normalize_rows(data0)
+        p.add_items(data0, list(range(n)))
+        log.info("HNSW: add_items done in %.2fs", time.perf_counter() - t_add0)
+    else:
+        log.info("HNSW: add_items start (batched) n=%d batch=%d", n, batch)
+        done = 0
+        while done < n:
+            end = min(n, done + batch)
+            # Convert each chunk to float32 (and normalize if needed) to keep memory bounded.
+            chunk = np.asarray(emb[done:end], dtype="float32")
+            if m == "cosine":
+                chunk = _l2_normalize_rows(chunk)
+            p.add_items(chunk, list(range(done, end)))
+            done = end
+            elapsed = time.perf_counter() - t_add0
+            rate = (done / elapsed) if elapsed > 1e-9 else 0.0
+            remaining = n - done
+            eta = (remaining / rate) if rate > 1e-9 else float("inf")
+            log.info(
+                "HNSW: add_items progress %d/%d (%.1f%%) elapsed=%.1fs rate=%.1f vec/s eta=%.1fs",
+                done,
+                n,
+                100.0 * float(done) / float(n),
+                elapsed,
+                rate,
+                eta,
+            )
+        log.info("HNSW: add_items done in %.2fs", time.perf_counter() - t_add0)
+
     # Set a conservative default ef for queries; can be overridden at query time.
     if hasattr(p, "set_ef"):
         p.set_ef(max(50, int(M) * 2))
+    t_save = time.perf_counter()
     p.save_index(out_index_path)
+    log.info("HNSW: save_index done in %.2fs", time.perf_counter() - t_save)
 
     meta = AnnIndexMeta(
         backend="hnswlib",
@@ -136,6 +224,8 @@ def build_hnsw_index(
         params={"ef_construction": int(ef_construction), "M": int(M), "seed": int(seed)},
     )
     _atomic_write_text(out_meta_path, json.dumps(meta.__dict__, indent=2, sort_keys=True) + "\n")
+    log.info("HNSW: wrote meta=%s", out_meta_path)
+    log.info("HNSW: build finished in %.2fs", time.perf_counter() - t0)
     return meta
 
 
@@ -187,19 +277,19 @@ class DenseIndex:
         if ef is not None and hasattr(self._hnsw, "set_ef"):
             self._hnsw.set_ef(int(ef))
         labels, distances = self._hnsw.knn_query(q, k=int(topk))
-        # hnswlib returns labels and distances; for ip metric distances are actually -ip? depends on backend.
-        # We'll convert to a "score" where higher is better:
-        # - For 'ip' we treat distance as similarity if hnswlib returns raw IP, otherwise we still get stable ranking.
-        # - For 'l2' we use negative distance so higher is better.
+        # hnswlib returns (labels, distances) where **smaller distance is better**.
+        # For spaces:
+        # - 'l2': distance is squared L2
+        # - 'ip': distance is (1 - inner_product) in hnswlib
+        # - 'cosine': we build the index as 'ip' on L2-normalized vectors
+        #
+        # We expose a "score" where **higher is better**, so we negate the returned distance.
         idxs = [int(x) for x in labels[0].tolist()]
         dists = [float(x) for x in distances[0].tolist()]
         out: List[Tuple[str, float]] = []
         for i, d in zip(idxs, dists):
             docid = self.docids[i]
-            if str(self.metric).lower() == "l2":
-                out.append((docid, -d))
-            else:
-                out.append((docid, d))
+            out.append((docid, -d))
         # Deterministic tie-break
         out.sort(key=lambda x: (-x[1], x[0]))
         return out
@@ -247,8 +337,19 @@ def load_hnsw_index(meta_path: str) -> DenseIndex:
         raise ValueError(f"Meta backend is not hnswlib: {meta.backend!r}")
     try:
         import hnswlib  # type: ignore
+        if not hasattr(hnswlib, "Index"):
+            raise ImportError(
+                "Imported 'hnswlib' but it has no attribute 'Index' (likely the local ./hnswlib/ directory shadowed it)."
+            )
     except Exception as e:
-        raise RuntimeError("Missing optional dependency: hnswlib (required to load ANN index).") from e
+        msg = (
+            "Unable to import optional dependency 'hnswlib' (required to load ANN index).\n\n"
+            "If you previously installed hnswlib but it fails with dlopen/symbol errors, reinstall it into the "
+            "same environment as the running `python`:\n"
+            "  python -m pip install -U --force-reinstall --no-binary=hnswlib hnswlib\n\n"
+            f"Original import error: {e!r}"
+        )
+        raise RuntimeError(msg) from e
 
     docids = load_docids(meta.docids_path)
     p = hnswlib.Index(space=("ip" if str(meta.metric).lower() in ("ip", "cosine") else str(meta.metric).lower()), dim=int(meta.dim))

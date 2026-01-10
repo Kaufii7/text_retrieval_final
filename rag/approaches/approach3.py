@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from rag.config import ApproachConfig, default_approach3_config
 from rag.lucene_backend import fetch_doc_contents
@@ -87,17 +87,27 @@ def _load_dense_index(params: Mapping[str, object]):
     return load_exact_index(embeddings_path=embeddings_path, docids_path=docids_path, metric=metric)
 
 
-def _embed_query(query: str, *, model_name: str, device: str, normalize_embeddings: bool):
-    # Lazy import for heavy deps
-    try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Approach 3 requires the optional dependency 'sentence-transformers' to embed queries. "
-            "Install it to run Approach 3."
-        ) from e
+def _embed_query(
+    query: str,
+    *,
+    model_name: str,
+    device: str,
+    normalize_embeddings: bool,
+    sagemaker_config: Optional[Mapping[str, object]] = None,
+):
+    """Embed a query using either local SentenceTransformer or SageMaker endpoint."""
+    from rag.approach3.sagemaker_embeddings import get_embedding_model
 
-    model = SentenceTransformer(model_name, device=device)
+    # Convert Mapping to dict if needed
+    sagemaker_dict = None
+    if sagemaker_config:
+        sagemaker_dict = dict(sagemaker_config) if isinstance(sagemaker_config, Mapping) else sagemaker_config
+
+    model = get_embedding_model(
+        model_name=model_name,
+        device=device,
+        sagemaker_config=sagemaker_dict,
+    )
     vec = model.encode(
         [query],
         batch_size=1,
@@ -119,6 +129,11 @@ def _rerank_with_cross_encoder(
     enabled = bool(_get_param(rerank_cfg, "enabled", False))
     if not enabled:
         return {}
+    if searcher is None:
+        raise RuntimeError(
+            "Approach 3 reranking requires a Pyserini searcher to fetch doc text, but searcher=None. "
+            "Either disable reranking (rerank.enabled=false) or run with a valid searcher."
+        )
 
     topn = int(_get_param(rerank_cfg, "topn", 100))
     if topn <= 0:
@@ -148,11 +163,30 @@ def _rerank_with_cross_encoder(
 def approach3_retrieve(
     *,
     queries: Sequence[Query],
-    searcher,
+    searcher=None,
     topk: int = 1000,
     config: Optional[ApproachConfig] = None,
 ) -> Dict[int, List[Mapping[str, object]]]:
     """Run Approach 3 retrieval for all queries."""
+    results_by_topic: Dict[int, List[Mapping[str, object]]] = {}
+    for topic_id, entries in approach3_retrieve_iter(queries=queries, searcher=searcher, topk=topk, config=config):
+        results_by_topic[int(topic_id)] = list(entries)
+    return results_by_topic
+
+
+def approach3_retrieve_iter(
+    *,
+    queries: Sequence[Query],
+    searcher=None,
+    topk: int = 1000,
+    config: Optional[ApproachConfig] = None,
+    skip_topic_ids: Optional[Sequence[int]] = None,
+) -> Iterator[Tuple[int, List[Mapping[str, object]]]]:
+    """Run Approach 3 retrieval yielding per-topic results (streaming friendly).
+
+    This is useful when you want to save a run file incrementally and be able to resume
+    after interruption (skip already-completed topics).
+    """
     if config is None:
         config = default_approach3_config()
     params = config.params or {}
@@ -177,6 +211,19 @@ def approach3_retrieve(
     if isinstance(hnsw_cfg, Mapping) and "ef" in hnsw_cfg and hnsw_cfg.get("ef") is not None:
         ef = int(hnsw_cfg.get("ef"))  # type: ignore[arg-type]
 
+    # Extract SageMaker config if present
+    sagemaker_cfg = dense_cfg.get("sagemaker")
+    if sagemaker_cfg and isinstance(sagemaker_cfg, Mapping):
+        # Convert to dict for compatibility
+        sagemaker_config = dict(sagemaker_cfg)
+    else:
+        sagemaker_config = None
+
+    # Load query embedder ONCE per run (avoids HuggingFace Hub checks per query)
+    from rag.approach3.sagemaker_embeddings import get_embedding_model
+
+    embedder = get_embedding_model(model_name=model_name, device=device, sagemaker_config=sagemaker_config)
+
     rerank_cfg = params.get("rerank") or {}
     if not isinstance(rerank_cfg, Mapping):
         rerank_cfg = {}
@@ -189,9 +236,17 @@ def approach3_retrieve(
     if alpha > 1.0:
         alpha = 1.0
 
-    results_by_topic: Dict[int, List[Mapping[str, object]]] = {}
+    skip_set = {int(x) for x in (skip_topic_ids or [])}
     for q in queries:
-        qvec = _embed_query(q.text, model_name=model_name, device=device, normalize_embeddings=normalize_embeddings)
+        if int(q.topic_id) in skip_set:
+            continue
+        qvec = embedder.encode(
+            [q.text],
+            batch_size=1,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=bool(normalize_embeddings),
+        )[0]
         candidates = index.search(qvec, topk=candidates_depth, ef=ef)
         # candidates: list[(docid, dense_score)] sorted with tie-breaks
 
@@ -214,11 +269,10 @@ def approach3_retrieve(
 
         final.sort(key=lambda x: (-x[1], x[0]))
         final = final[: int(topk)]
-        results_by_topic[q.topic_id] = [{"docid": docid, "score": float(score)} for docid, score in final]
+        yield int(q.topic_id), [{"docid": docid, "score": float(score)} for docid, score in final]
 
         if not candidates:
             log.warning("No dense candidates for topic_id=%s", q.topic_id)
-
-    return results_by_topic
+    return
 
 

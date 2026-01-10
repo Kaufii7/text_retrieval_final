@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from typing import List
 
 from rag.approaches.approach1 import bm25_retrieve
@@ -33,6 +34,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-tag", default="run1", help="Run tag (column 6).")
     p.add_argument("--topk", type=int, default=1000, help="Max docs per query (default: 1000).")
     p.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, ...).")
+    p.add_argument(
+        "--stream-output",
+        action="store_true",
+        help="Write output incrementally (only supported for --approach approach3).",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume incremental output from an existing partial run (only supported for --approach approach3).",
+    )
 
     # BM25 params
     p.add_argument("--k1", type=float, default=0.9)
@@ -73,8 +84,8 @@ def main() -> int:
     queries = _split_queries(queries, args.split, train_topics=50)
     log.info("Loaded %d queries for split=%s", len(queries), args.split)
 
-    searcher = get_searcher(args.index)
     if args.approach == "bm25":
+        searcher = get_searcher(args.index)
         results_by_topic = bm25_retrieve(
             queries=queries,
             searcher=searcher,
@@ -83,6 +94,7 @@ def main() -> int:
             b=args.b,
         )
     elif args.approach == "clustpsg":
+        searcher = get_searcher(args.index)
         # clustpsg returns (docid, score) tuples; convert to run-writer-compatible entries
         run = clustpsg_run(
             queries=queries,
@@ -104,22 +116,74 @@ def main() -> int:
             from rag.config import load_approach_config_json
 
             cfg = load_approach_config_json(args.approach3_config)
-        results_by_topic = approach3_retrieve(
-            queries=queries,
-            searcher=searcher,
-            topk=args.topk,
-            config=cfg,
-        )
+        else:
+            # Default config has reranking disabled; this lets us run stage-1 dense retrieval
+            # without initializing Pyserini/Java (avoids macOS libomp/JVM crashes).
+            from rag.config import default_approach3_config
+
+            cfg = default_approach3_config()
+
+        # Only initialize Pyserini/Java searcher if reranking is enabled (needs doc text).
+        params = cfg.params or {}
+        rerank_cfg = params.get("rerank") if isinstance(params, dict) else None
+        rerank_enabled = False
+        if isinstance(rerank_cfg, dict):
+            rerank_enabled = bool(rerank_cfg.get("enabled", False))
+
+        searcher = get_searcher(args.index) if rerank_enabled else None
+        if searcher is None:
+            log.info("Approach3: rerank disabled -> running stage-1 dense retrieval without Pyserini/Java searcher.")
+        # Streaming/resume mode: save results as we go and allow restart without losing progress.
+        if bool(args.stream_output) or bool(args.resume):
+            from rag.approaches.approach3 import approach3_retrieve_iter
+            from rag.runs import append_trec_run_topic, load_trec_run_topic_ids
+
+            partial_out = str(args.output) + ".partial"
+            done_topics = set()
+            if bool(args.resume) and os.path.exists(partial_out):
+                done_topics = set(load_trec_run_topic_ids(partial_out))
+                log.info("Resuming Approach 3 run: found %d completed topics in %s", len(done_topics), partial_out)
+            else:
+                # Fresh streaming run: truncate partial output if it exists.
+                os.makedirs(os.path.dirname(partial_out) or ".", exist_ok=True)
+                with open(partial_out, "w", encoding="utf-8") as f:
+                    f.write("")
+
+            for topic_id, entries in approach3_retrieve_iter(
+                queries=queries,
+                searcher=searcher,
+                topk=int(args.topk),
+                config=cfg,
+                skip_topic_ids=sorted(done_topics),
+            ):
+                append_trec_run_topic(
+                    output_path=partial_out,
+                    topic_id=int(topic_id),
+                    entries=entries,
+                    run_tag=str(args.run_tag),
+                    topk=int(args.topk),
+                )
+            os.replace(partial_out, str(args.output))
+            log.info("Wrote run file: %s", args.output)
+            results_by_topic = None
+        else:
+            results_by_topic = approach3_retrieve(
+                queries=queries,
+                searcher=searcher,
+                topk=args.topk,
+                config=cfg,
+            )
     else:
         raise ValueError("Unknown approach: {0}".format(args.approach))
 
-    write_trec_run(
-        results_by_topic=results_by_topic,
-        output_path=args.output,
-        run_tag=args.run_tag,
-        topk=args.topk,
-    )
-    log.info("Wrote run file: %s", args.output)
+    if results_by_topic is not None:
+        write_trec_run(
+            results_by_topic=results_by_topic,
+            output_path=args.output,
+            run_tag=args.run_tag,
+            topk=args.topk,
+        )
+        log.info("Wrote run file: %s", args.output)
 
     if args.evaluate:
         from rag.io import load_qrels

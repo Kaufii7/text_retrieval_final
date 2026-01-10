@@ -23,7 +23,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, Optional, Tuple
 
 
 def _sha256_file(path: str, *, chunk_size: int = 1024 * 1024) -> str:
@@ -44,8 +44,52 @@ def _atomic_write_text(path: str, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_write_json(path: str, obj: Any) -> None:
+    _atomic_write_text(path, json.dumps(obj, indent=2, sort_keys=True) + "\n")
+
+
+def _try_read_json(path: str) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _resolve_device(requested: str) -> str:
+    """Resolve a device string for torch-backed models.
+
+    Supported:
+    - "auto": prefer CUDA, then MPS (Apple Silicon), else CPU
+    - "gpu": alias of "auto"
+    - explicit: "cpu" | "cuda" | "mps" | "cuda:0" etc.
+    """
+    req = (requested or "auto").strip().lower()
+    if req in ("", "auto", "gpu"):
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                return "cuda"
+            # MPS on macOS Apple Silicon
+            if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():  # type: ignore
+                return "mps"
+        except Exception:
+            pass
+        return "cpu"
+    return requested
 
 
 def _best_effort_doc_text(searcher, docid: str) -> str:
@@ -206,16 +250,30 @@ def build_corpus_jsonl(
     out_docids_txt: str,
     max_docs: Optional[int] = None,
     force: bool = False,
+    resume: bool = True,
+    save_every: int = 5000,
+    logger: Optional[logging.Logger] = None,
 ) -> Tuple[int, str]:
     """Build corpus JSONL + aligned docid list.
 
     Returns: (num_docs_written, sha256(docids_txt))
     """
+    log = logger or logging.getLogger("rag.approach3.build_dense_assets")
     if (not force) and os.path.exists(out_corpus_jsonl) and os.path.exists(out_docids_txt):
         # Assume outputs are already built.
+        log.info("Corpus: using existing outputs corpus=%s docids=%s", out_corpus_jsonl, out_docids_txt)
         return _count_lines(out_docids_txt), _sha256_file(out_docids_txt)
 
     _ensure_dir(os.path.dirname(out_corpus_jsonl) or ".")
+    log.info(
+        "Corpus: build start index=%s out_corpus=%s out_docids=%s max_docs=%s resume=%s save_every=%d",
+        str(index_name),
+        str(out_corpus_jsonl),
+        str(out_docids_txt),
+        "None" if max_docs is None else str(int(max_docs)),
+        str(bool(resume)),
+        int(save_every),
+    )
 
     # Import Pyserini only when building.
     from rag.lucene_backend import get_searcher
@@ -223,26 +281,96 @@ def build_corpus_jsonl(
     searcher = get_searcher(index_name)
     docids_iter = _iter_docids(index_name)
 
-    tmp_corpus = out_corpus_jsonl + ".tmp"
-    tmp_docids = out_docids_txt + ".tmp"
+    # Resume/safe-write:
+    # - write to ".partial" files and checkpoint progress to ".progress.json"
+    # - on success, atomically replace final outputs
+    partial_corpus = out_corpus_jsonl + ".partial"
+    partial_docids = out_docids_txt + ".partial"
+    progress_path = out_docids_txt + ".progress.json"
 
-    n = 0
-    with open(tmp_corpus, "w", encoding="utf-8") as f_corpus, open(tmp_docids, "w", encoding="utf-8") as f_docids:
-        for docid in docids_iter:
-            if max_docs is not None and n >= int(max_docs):
-                break
-            docid_s = str(docid)
-            text = _best_effort_doc_text(searcher, docid_s)
-            rec = {"docid": docid_s, "text": text}
-            # Stable json encoding (no whitespace variability).
-            f_corpus.write(json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-            f_docids.write(docid_s + "\n")
-            n += 1
+    if force:
+        _safe_unlink(partial_corpus)
+        _safe_unlink(partial_docids)
+        _safe_unlink(progress_path)
 
-    os.replace(tmp_corpus, out_corpus_jsonl)
-    os.replace(tmp_docids, out_docids_txt)
+    n_written = 0
+    if resume and os.path.exists(partial_corpus) and os.path.exists(partial_docids):
+        n_written = _count_lines(partial_docids)
+        log.info("Corpus resume: found %d docs already written in partial outputs.", n_written)
+    else:
+        _safe_unlink(partial_corpus)
+        _safe_unlink(partial_docids)
+        _safe_unlink(progress_path)
 
-    return n, _sha256_file(out_docids_txt)
+    mode = "a" if n_written > 0 else "w"
+    n = int(n_written)
+    last_save_n = int(n_written)
+    t0 = time.perf_counter()
+
+    with open(partial_corpus, mode, encoding="utf-8") as f_corpus, open(partial_docids, mode, encoding="utf-8") as f_docids:
+        try:
+            for i, docid in enumerate(docids_iter):
+                if i < int(n_written):
+                    continue
+                if max_docs is not None and n >= int(max_docs):
+                    break
+                docid_s = str(docid)
+                text = _best_effort_doc_text(searcher, docid_s)
+                rec = {"docid": docid_s, "text": text}
+                f_corpus.write(json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                f_docids.write(docid_s + "\n")
+                n += 1
+
+                if int(save_every) > 0 and (n - last_save_n) >= int(save_every):
+                    f_corpus.flush()
+                    f_docids.flush()
+                    _atomic_write_json(
+                        progress_path,
+                        {
+                            "kind": "approach3_corpus_build",
+                            "index": str(index_name),
+                            "out_corpus_jsonl": str(out_corpus_jsonl),
+                            "out_docids_txt": str(out_docids_txt),
+                            "partial_corpus": str(partial_corpus),
+                            "partial_docids": str(partial_docids),
+                            "max_docs": None if max_docs is None else int(max_docs),
+                            "docs_done": int(n),
+                            "updated_at_utc": _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                        },
+                    )
+                    last_save_n = n
+                    elapsed = time.perf_counter() - t0
+                    rate = (n / elapsed) if elapsed > 1e-9 else 0.0
+                    log.info("Corpus progress: %d docs written (%.1f docs/s)", n, rate)
+        except KeyboardInterrupt:
+            # Ensure we checkpoint as close as possible to the interruption point.
+            try:
+                f_corpus.flush()
+                f_docids.flush()
+                _atomic_write_json(
+                    progress_path,
+                    {
+                        "kind": "approach3_corpus_build",
+                        "index": str(index_name),
+                        "out_corpus_jsonl": str(out_corpus_jsonl),
+                        "out_docids_txt": str(out_docids_txt),
+                        "partial_corpus": str(partial_corpus),
+                        "partial_docids": str(partial_docids),
+                        "max_docs": None if max_docs is None else int(max_docs),
+                        "docs_done": int(n),
+                        "updated_at_utc": _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                        "interrupted": True,
+                    },
+                )
+            except Exception:
+                pass
+            log.warning("Corpus build interrupted. Checkpointed at docs_done=%d. You can rerun to resume.", int(n))
+            raise
+
+    os.replace(partial_corpus, out_corpus_jsonl)
+    os.replace(partial_docids, out_docids_txt)
+    _safe_unlink(progress_path)
+    return int(n), _sha256_file(out_docids_txt)
 
 
 def _count_lines(path: str) -> int:
@@ -282,11 +410,20 @@ def build_embeddings_npy(
     device: str = "cpu",
     normalize_embeddings: bool = True,
     force: bool = False,
+    resume: bool = True,
+    save_every: int = 5000,
     log_every: int = 5000,
     show_progress_bar: bool = False,
     logger: Optional[logging.Logger] = None,
+    sagemaker_config: Optional[dict] = None,
 ) -> Tuple[int, int]:
     """Compute embeddings for the corpus JSONL and write a .npy matrix.
+
+    Args:
+        sagemaker_config: Optional dict with SageMaker config:
+            - enabled: bool
+            - endpoint_name: str
+            - region: str (optional)
 
     Returns: (num_docs, embedding_dim)
     """
@@ -296,83 +433,183 @@ def build_embeddings_npy(
             import numpy as np
 
             arr = np.load(out_embeddings_npy, mmap_mode="r")
+            log = logger or logging.getLogger("rag.approach3.build_dense_assets")
+            log.info(
+                "Embedding: using existing output embeddings=%s shape=(%d,%d) dtype=%s",
+                out_embeddings_npy,
+                int(arr.shape[0]),
+                int(arr.shape[1]),
+                str(arr.dtype),
+            )
             return int(arr.shape[0]), int(arr.shape[1])
         except Exception:
             pass
 
     log = logger or logging.getLogger("rag.approach3.build_dense_assets")
 
-    try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Missing dependency for embeddings: sentence-transformers. "
-            "Install it in your environment to build dense embeddings."
-        ) from e
-
     import numpy as np
     from numpy.lib.format import open_memmap
 
-    # First pass: count docs to allocate array deterministically.
-    t_count = time.perf_counter()
-    num_docs = 0
-    for _docid, _text in _iter_corpus_texts(corpus_jsonl):
-        num_docs += 1
-    log.info("Embedding: counted %d docs in %.2fs", num_docs, time.perf_counter() - t_count)
+    # Import embedding adapter (handles both local and SageMaker)
+    from rag.approach3.sagemaker_embeddings import get_embedding_model
 
-    if num_docs <= 0:
+    _ensure_dir(os.path.dirname(out_embeddings_npy) or ".")
+
+    # Resume/safe-write:
+    # - write to ".partial" file and checkpoint progress to ".progress.json"
+    # - on success, atomically replace final output
+    partial = out_embeddings_npy + ".partial"
+    progress_path = out_embeddings_npy + ".progress.json"
+
+    if force:
+        _safe_unlink(partial)
+        _safe_unlink(progress_path)
+
+    progress = _try_read_json(progress_path) if (resume and os.path.exists(progress_path)) else None
+    rows_done = int(progress.get("rows_done") or 0) if progress else 0
+    num_docs = int(progress.get("num_docs")) if (progress and progress.get("num_docs") is not None) else None
+    dim = int(progress.get("dim")) if (progress and progress.get("dim") is not None) else None
+    if progress:
+        log.info("Embedding resume: rows_done=%d num_docs=%s dim=%s", rows_done, str(num_docs), str(dim))
+
+    if num_docs is None:
+        t_count = time.perf_counter()
+        n_count = 0
+        for _docid, _text in _iter_corpus_texts(corpus_jsonl):
+            n_count += 1
+        num_docs = int(n_count)
+        log.info("Embedding: counted %d docs in %.2fs", num_docs, time.perf_counter() - t_count)
+
+    if int(num_docs) <= 0:
         raise ValueError(f"No documents found in corpus: {corpus_jsonl}")
 
     t_model = time.perf_counter()
-    model = SentenceTransformer(model_name, device=device)
-    dim = int(model.get_sentence_embedding_dimension())
+    model = get_embedding_model(model_name=model_name, device=device, sagemaker_config=sagemaker_config)
+    if dim is None:
+        dim = int(model.get_sentence_embedding_dimension())
+
+    model_desc = (
+        f"SageMaker endpoint: {sagemaker_config.get('endpoint_name')}"
+        if (sagemaker_config and sagemaker_config.get("enabled"))
+        else f"local model={model_name} device={device}"
+    )
+    log.info("Embedding: loaded %s dim=%d in %.2fs", model_desc, int(dim), time.perf_counter() - t_model)
     log.info(
-        "Embedding: loaded model=%r device=%r dim=%d in %.2fs",
-        model_name,
-        device,
-        dim,
-        time.perf_counter() - t_model,
+        "Embedding: build start corpus=%s out=%s num_docs=%d batch_size=%d normalize=%s save_every=%d log_every=%d",
+        str(corpus_jsonl),
+        str(out_embeddings_npy),
+        int(num_docs),
+        int(batch_size),
+        str(bool(normalize_embeddings)),
+        int(save_every),
+        int(log_every),
     )
 
-    _ensure_dir(os.path.dirname(out_embeddings_npy) or ".")
-    tmp = out_embeddings_npy + ".tmp"
-
-    # Write using numpy .npy memmap for large arrays.
-    mmap = open_memmap(tmp, mode="w+", dtype="float32", shape=(num_docs, dim))
+    # Open/create the partial memmap
+    if resume and os.path.exists(partial):
+        try:
+            mmap = open_memmap(partial, mode="r+")
+            if int(mmap.shape[0]) != int(num_docs) or int(mmap.shape[1]) != int(dim):
+                raise ValueError(
+                    f"Partial embeddings shape mismatch: got={tuple(mmap.shape)} expected={(int(num_docs), int(dim))}"
+                )
+        except Exception:
+            _safe_unlink(partial)
+            _safe_unlink(progress_path)
+            mmap = open_memmap(partial, mode="w+", dtype="float32", shape=(int(num_docs), int(dim)))
+            rows_done = 0
+    else:
+        _safe_unlink(partial)
+        _safe_unlink(progress_path)
+        mmap = open_memmap(partial, mode="w+", dtype="float32", shape=(int(num_docs), int(dim)))
+        rows_done = 0
 
     buf_texts = []
-    row = 0
+    row = int(rows_done)
     last_log_row = 0
+    last_save_row = int(rows_done)
     t0 = time.perf_counter()
-    for _docid, text in _iter_corpus_texts(corpus_jsonl):
-        buf_texts.append(text)
-        if len(buf_texts) >= int(batch_size):
-            emb = model.encode(
-                buf_texts,
-                batch_size=int(batch_size),
-                show_progress_bar=bool(show_progress_bar),
-                convert_to_numpy=True,
-                normalize_embeddings=bool(normalize_embeddings),
-            )
-            mmap[row : row + emb.shape[0], :] = emb.astype("float32", copy=False)
-            row += int(emb.shape[0])
-            buf_texts = []
-
-            if int(log_every) > 0 and (row - last_log_row) >= int(log_every):
-                elapsed = time.perf_counter() - t0
-                rate = (row / elapsed) if elapsed > 1e-9 else 0.0
-                remaining = max(0, num_docs - row)
-                eta = (remaining / rate) if rate > 1e-9 else float("inf")
-                log.info(
-                    "Embedding progress: %d/%d (%.1f%%) elapsed=%.1fs rate=%.1f docs/s eta=%.1fs",
-                    row,
-                    num_docs,
-                    100.0 * float(row) / float(num_docs),
-                    elapsed,
-                    rate,
-                    eta,
+    try:
+        for i, (_docid, text) in enumerate(_iter_corpus_texts(corpus_jsonl)):
+            if i < int(rows_done):
+                continue
+            buf_texts.append(text)
+            if len(buf_texts) >= int(batch_size):
+                emb = model.encode(
+                    buf_texts,
+                    batch_size=int(batch_size),
+                    show_progress_bar=bool(show_progress_bar),
+                    convert_to_numpy=True,
+                    normalize_embeddings=bool(normalize_embeddings),
                 )
-                last_log_row = row
+                mmap[row : row + emb.shape[0], :] = emb.astype("float32", copy=False)
+                row += int(emb.shape[0])
+                buf_texts = []
+
+                if int(save_every) > 0 and (row - last_save_row) >= int(save_every):
+                    mmap.flush()
+                    _atomic_write_json(
+                        progress_path,
+                        {
+                            "kind": "approach3_embeddings_build",
+                            "corpus_jsonl": str(corpus_jsonl),
+                            "out_embeddings_npy": str(out_embeddings_npy),
+                            "partial": str(partial),
+                            "model_name": str(model_name),
+                            "device": str(device),
+                            "normalize_embeddings": bool(normalize_embeddings),
+                            "batch_size": int(batch_size),
+                            "sagemaker": sagemaker_config,
+                            "num_docs": int(num_docs),
+                            "dim": int(dim),
+                            "rows_done": int(row),
+                            "updated_at_utc": _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                        },
+                    )
+                    last_save_row = row
+
+                if int(log_every) > 0 and (row - last_log_row) >= int(log_every):
+                    elapsed = time.perf_counter() - t0
+                    rate = (row / elapsed) if elapsed > 1e-9 else 0.0
+                    remaining = max(0, num_docs - row)
+                    eta = (remaining / rate) if rate > 1e-9 else float("inf")
+                    log.info(
+                        "Embedding progress: %d/%d (%.1f%%) elapsed=%.1fs rate=%.1f docs/s eta=%.1fs",
+                        row,
+                        num_docs,
+                        100.0 * float(row) / float(num_docs),
+                        elapsed,
+                        rate,
+                        eta,
+                    )
+                    last_log_row = row
+    except KeyboardInterrupt:
+        # Ensure we checkpoint as close as possible to the interruption point.
+        try:
+            mmap.flush()
+            _atomic_write_json(
+                progress_path,
+                {
+                    "kind": "approach3_embeddings_build",
+                    "corpus_jsonl": str(corpus_jsonl),
+                    "out_embeddings_npy": str(out_embeddings_npy),
+                    "partial": str(partial),
+                    "model_name": str(model_name),
+                    "device": str(device),
+                    "normalize_embeddings": bool(normalize_embeddings),
+                    "batch_size": int(batch_size),
+                    "sagemaker": sagemaker_config,
+                    "num_docs": int(num_docs),
+                    "dim": int(dim),
+                    "rows_done": int(row),
+                    "updated_at_utc": _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                    "interrupted": True,
+                },
+            )
+        except Exception:
+            pass
+        log.warning("Embedding interrupted. Checkpointed at rows_done=%d. You can rerun to resume.", int(row))
+        raise
 
     if buf_texts:
         emb = model.encode(
@@ -387,11 +624,12 @@ def build_embeddings_npy(
 
     # Flush and atomically move into place.
     mmap.flush()
-    os.replace(tmp, out_embeddings_npy)
+    os.replace(partial, out_embeddings_npy)
+    _safe_unlink(progress_path)
     elapsed = time.perf_counter() - t0
     rate = (row / elapsed) if elapsed > 1e-9 else 0.0
     log.info("Embedding: finished %d docs in %.2fs (%.1f docs/s)", row, elapsed, rate)
-    return num_docs, dim
+    return int(num_docs), int(dim)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -403,7 +641,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="sentence-transformers/all-mpnet-base-v2",
         help="SentenceTransformers model name for the bi-encoder.",
     )
-    p.add_argument("--device", default="cpu", help="Device for embedding model (cpu|cuda).")
+    p.add_argument("--device", default="auto", help="Device for embedding model (auto|cpu|cuda|mps).")
     p.add_argument("--batch-size", type=int, default=64, help="Batch size for encoding.")
     p.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, ...).")
     p.add_argument("--log-every", type=int, default=5000, help="Log embedding progress every N documents.")
@@ -425,9 +663,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--force", action="store_true", help="Rebuild artifacts even if they already exist.")
     p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resume mode (otherwise partial outputs + progress checkpoints are used).",
+    )
+    p.add_argument(
+        "--save-every",
+        type=int,
+        default=5000,
+        help="Checkpoint embeddings every N docs (flush + write *.progress.json).",
+    )
+    p.add_argument(
+        "--corpus-save-every",
+        type=int,
+        default=5000,
+        help="Checkpoint corpus/docids every N docs (flush + write *.progress.json).",
+    )
+    p.add_argument(
         "--skip-embeddings",
         action="store_true",
         help="Only build corpus/docids (skip embedding computation).",
+    )
+    # SageMaker options
+    p.add_argument(
+        "--sagemaker-endpoint",
+        type=str,
+        default=None,
+        help="Use SageMaker endpoint instead of local model (provide endpoint name).",
+    )
+    p.add_argument(
+        "--sagemaker-region",
+        type=str,
+        default="eu-north-1",
+        help="AWS region for SageMaker endpoint (default: eu-north-1).",
     )
     return p
 
@@ -447,7 +715,24 @@ def main() -> int:
     max_docs = args.max_docs if args.max_docs is None else int(args.max_docs)
 
     _ensure_dir(out_dir)
+    log = logging.getLogger("rag.approach3.build_dense_assets")
     paths = default_assets_paths(out_dir=out_dir, index_name=index_name, model_name=model_name)
+    log.info(
+        "Dense assets: start index=%s model=%s out_dir=%s max_docs=%s force=%s resume=%s",
+        index_name,
+        model_name,
+        out_dir,
+        "None" if max_docs is None else str(int(max_docs)),
+        str(bool(args.force)),
+        str(not bool(args.no_resume)),
+    )
+    log.info(
+        "Dense assets: paths corpus=%s docids=%s embeddings=%s meta=%s",
+        paths.corpus_jsonl,
+        paths.docids_txt,
+        paths.embeddings_npy,
+        paths.meta_json,
+    )
 
     n_docs, docids_sha = build_corpus_jsonl(
         index_name=index_name,
@@ -455,11 +740,22 @@ def main() -> int:
         out_docids_txt=paths.docids_txt,
         max_docs=max_docs,
         force=bool(args.force),
+        resume=not bool(args.no_resume),
+        save_every=int(args.corpus_save_every),
+        logger=logging.getLogger("rag.approach3.build_dense_assets"),
     )
 
     emb_docs = None
     emb_dim = None
     if not bool(args.skip_embeddings):
+        # Build SageMaker config if endpoint is provided
+        sagemaker_config = None
+        if args.sagemaker_endpoint:
+            sagemaker_config = {
+                "enabled": True,
+                "endpoint_name": str(args.sagemaker_endpoint),
+                "region": str(args.sagemaker_region),
+            }
         emb_docs, emb_dim = build_embeddings_npy(
             corpus_jsonl=paths.corpus_jsonl,
             out_embeddings_npy=paths.embeddings_npy,
@@ -468,9 +764,12 @@ def main() -> int:
             device=str(args.device),
             normalize_embeddings=not bool(args.no_normalize),
             force=bool(args.force),
+            resume=not bool(args.no_resume),
+            save_every=int(args.save_every),
             log_every=int(args.log_every),
             show_progress_bar=bool(args.show_progress_bar),
             logger=logging.getLogger("rag.approach3.build_dense_assets"),
+            sagemaker_config=sagemaker_config,
         )
 
     meta = {
@@ -492,12 +791,14 @@ def main() -> int:
             "device": str(args.device),
             "batch_size": int(args.batch_size),
             "normalize_embeddings": not bool(args.no_normalize),
+            "sagemaker": sagemaker_config if not bool(args.skip_embeddings) else None,
         },
         "checksums": {
             "docids_sha256": docids_sha,
         },
     }
     _atomic_write_text(paths.meta_json, json.dumps(meta, indent=2, sort_keys=True) + "\n")
+    log.info("Dense assets: wrote meta=%s", paths.meta_json)
 
     print("Wrote:")
     print(f"- corpus: {paths.corpus_jsonl}")
