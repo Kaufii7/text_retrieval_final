@@ -135,5 +135,3 @@ def append_trec_run_topic(
 
     with open(output_path, "a", encoding="utf-8") as f:
         f.writelines(lines)
-
-
