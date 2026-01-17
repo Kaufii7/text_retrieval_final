@@ -58,12 +58,12 @@ def default_approach2_config() -> ApproachConfig:
                 # model: "bm25" | "bm25+rm3" | "qld" | "qld+rm3"
                 "model": "bm25+rm3",
                 # BM25 params (used by "bm25" and "bm25+rm3")
-                "k1": 1.0, # Term frequency normalization
-                "b": 0.8, # Length normalization
+                "k1": 0.6895366011206422, # Term frequency normalization
+                "b": 0.2750076706717374, # Length normalization
                 # RM3 params (used by "bm25+rm3" and "qld+rm3")
-                "rm3_fb_terms": 10,
-                "rm3_fb_docs": 30,
-                "rm3_original_query_weight": 0.5,
+                "rm3_fb_terms": 17,
+                "rm3_fb_docs": 80,
+                "rm3_original_query_weight": 0.3476334304965827,
                 # QLD param (used by "qld" and "qld+rm3")
                 "qld_mu": 1000,
             },
@@ -177,7 +177,7 @@ def default_approach2_config() -> ApproachConfig:
             "final": {
                 # If true, cluster scores come from RankSVM predictions.
                 # If false, cluster scores are derived from the cluster seed passage rank.
-                "use_svm_cluster_scores": True,
+                "use_svm_cluster_scores": False,
                 # Safety: blend RankSVM scores with the seed-heuristic cluster score
                 # to reduce degradation from noisy model predictions.
                 #
@@ -229,7 +229,7 @@ def default_approach2_config() -> ApproachConfig:
             },
 
             # PR8 pipeline limits (runtime control during development)
-            "doc_content_topk": 2000,
+            "doc_content_topk": 5000,
             # Fewer passages => much faster O(n^2) clustering
             "clustering_max_passages": 200,
             # Candidate generation depth for clustpsg (retrieve this many docs, then rerank, then output topk=1000).

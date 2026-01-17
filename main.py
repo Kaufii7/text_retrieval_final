@@ -5,13 +5,12 @@ import logging
 import os
 from typing import List
 
-from rag.approaches.approach1 import bm25_retrieve
-from rag.approaches.approach3 import approach3_retrieve
-from rag.clustpsg.pipeline import clustpsg_run
-from rag.eval import load_trec_run, mean_average_precision
+from rag.approaches.approach1 import bm25_retrieve, bm25_rm3_retrieve
+from rag.eval import average_precision, load_trec_run, mean_average_precision
 from rag.io import Query, load_queries
 from rag.logging_utils import configure_logging
 from rag.lucene_backend import get_searcher
+from rag.query_expansion import expand_query_text_reque_wordnet
 from rag.runs import write_trec_run
 
 
@@ -49,6 +48,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--k1", type=float, default=0.9)
     p.add_argument("--b", type=float, default=0.4)
 
+    # RM3 (Approach 1 optional; applies on top of BM25)
+    p.add_argument("--rm3", action="store_true", help="Enable RM3 pseudo-relevance feedback for --approach bm25.")
+    p.add_argument("--rm3-fb-terms", type=int, default=50, help="RM3 fb_terms (default: 50).")
+    p.add_argument("--rm3-fb-docs", type=int, default=50, help="RM3 fb_docs (default: 50).")
+    p.add_argument(
+        "--rm3-orig-weight",
+        type=float,
+        default=0.2,
+        help="RM3 original_query_weight in [0,1] (default: 0.2).",
+    )
+
+    # Query expansion (Approach 1)
+    p.add_argument(
+        "--qe",
+        choices=["none", "reque_wordnet"],
+        default="none",
+        help="Optional query expansion for --approach bm25 (default: none).",
+    )
+    p.add_argument("--qe-topn", type=int, default=3, help="Top-N expansions per term for ReQue WordNet (default: 3).")
+    p.add_argument(
+        "--qe-replace",
+        action="store_true",
+        help="If set, allow replacement behavior in some expanders (default: append-only).",
+    )
+
     # Index
     p.add_argument("--index", default="robust04", help="Pyserini prebuilt index name.")
 
@@ -85,15 +109,46 @@ def main() -> int:
     log.info("Loaded %d queries for split=%s", len(queries), args.split)
 
     if args.approach == "bm25":
+        if args.qe != "none":
+            if args.qe == "reque_wordnet":
+                queries = [
+                    Query(
+                        id=q.id,
+                        content=expand_query_text_reque_wordnet(
+                            query_text=q.content,
+                            topn=int(args.qe_topn),
+                            replace=bool(args.qe_replace),
+                        ),
+                    )
+                    for q in queries
+                ]
+            else:
+                raise ValueError(f"Unknown --qe option: {args.qe}")
+
         searcher = get_searcher(args.index)
-        results_by_topic = bm25_retrieve(
-            queries=queries,
-            searcher=searcher,
-            topk=args.topk,
-            k1=args.k1,
-            b=args.b,
-        )
+        if bool(args.rm3):
+            results_by_topic = bm25_rm3_retrieve(
+                queries=queries,
+                searcher=searcher,
+                topk=args.topk,
+                k1=args.k1,
+                b=args.b,
+                rm3_fb_terms=int(args.rm3_fb_terms),
+                rm3_fb_docs=int(args.rm3_fb_docs),
+                rm3_original_query_weight=float(args.rm3_orig_weight),
+            )
+        else:
+            results_by_topic = bm25_retrieve(
+                queries=queries,
+                searcher=searcher,
+                topk=args.topk,
+                k1=args.k1,
+                b=args.b,
+            )
     elif args.approach == "clustpsg":
+        # Lazy import: keep `main.py` usable for BM25 runs even if Approach 2 deps/code change.
+        from rag.clustpsg.pipeline import clustpsg_run
+
         searcher = get_searcher(args.index)
         # clustpsg returns (docid, score) tuples; convert to run-writer-compatible entries
         run = clustpsg_run(
@@ -111,6 +166,9 @@ def main() -> int:
             return 0
         results_by_topic = {tid: [{"docid": docid, "score": score} for docid, score in pairs] for tid, pairs in run.items()}
     elif args.approach == "approach3":
+        # Lazy import: Approach 3 has heavy optional deps; don't import unless needed.
+        from rag.approaches.approach3 import approach3_retrieve
+
         cfg = None
         if args.approach3_config:
             from rag.config import load_approach_config_json
@@ -190,10 +248,34 @@ def main() -> int:
 
         qrels = load_qrels(args.qrels)
         run = load_trec_run(args.output, k=args.eval_k)
-        map_value, ap_by_topic = mean_average_precision(qrels, run, k=args.eval_k)
+        qrels_topics = set(qrels.keys())
+        run_topics = set(run.keys())
+        overlap = sorted(qrels_topics.intersection(run_topics))
+
+        if not overlap:
+            # This commonly happens when evaluating a test split run with a train-only qrels file.
+            raise ValueError(
+                "No topic overlap between run and qrels; MAP would be 0 by construction.\n"
+                f"- run topics:  count={len(run_topics)}, min={min(run_topics) if run_topics else 'n/a'}, max={max(run_topics) if run_topics else 'n/a'}\n"
+                f"- qrels topics: count={len(qrels_topics)}, min={min(qrels_topics) if qrels_topics else 'n/a'}, max={max(qrels_topics) if qrels_topics else 'n/a'}\n"
+                "Fix: either run with --split train (to match qrels_50_Queries), or pass a qrels file that matches your evaluated topics via --qrels."
+            )
+
+        # Compute MAP over the overlapping topics only.
+        ap_by_topic = {tid: average_precision(qrels[tid], run.get(tid, []), k=args.eval_k) for tid in overlap}
+        map_value = sum(ap_by_topic.values()) / float(len(ap_by_topic)) if ap_by_topic else 0.0
+
+        if len(overlap) < len(qrels_topics):
+            log.warning(
+                "Evaluating on topic intersection only: overlap=%d, qrels_topics=%d, run_topics=%d",
+                len(overlap),
+                len(qrels_topics),
+                len(run_topics),
+            )
+
         print(f"MAP@{args.eval_k}: {map_value:.6f}")
         if args.per_topic:
-            for topic_id in sorted(ap_by_topic.keys()):
+            for topic_id in overlap:
                 print(f"{topic_id}\t{ap_by_topic[topic_id]:.6f}")
     return 0
 

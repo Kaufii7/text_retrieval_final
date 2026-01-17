@@ -1,0 +1,15 @@
+{
+  "approach": "bm25",
+  "how_to_run": ".venv/bin/python main.py --approach bm25 --split train --topk 1000 --k1 0.654794 --b 0.401165 --qe none",
+  "index": "robust04",
+  "metric": {
+    "name": "MAP@1000",
+    "value": 0.2475487769184912
+  },
+  "notes": "Optuna-tuned BM25 params for Approach1. No query expansion. No RM3.",
+  "params": {
+    "b": 0.40116457041584336,
+    "k1": 0.6547938081729197
+  },
+  "topk": 1000
+}

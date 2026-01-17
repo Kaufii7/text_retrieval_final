@@ -1,0 +1,200 @@
+{
+  "approach": "clustpsg",
+  "best_config": {
+    "candidates_depth": null,
+    "name": "clustpsg",
+    "params": {
+      "cluster_labeling": {
+        "best_rank_high": 20,
+        "best_rank_low": 100,
+        "method": "pseudo_passage_overlap",
+        "pseudo_lucene": {
+          "b": 0.4,
+          "cache_dir": "cache/passage_lucene",
+          "k1": 0.9,
+          "mode": "temp",
+          "rm3": {
+            "enabled": true,
+            "fb_docs": 10,
+            "fb_terms": 50,
+            "original_query_weight": 0.2
+          }
+        },
+        "pseudo_overlap_high": 2,
+        "pseudo_overlap_low": 1,
+        "pseudo_topk_per_doc": 3,
+        "rr_k": 40,
+        "threshold_high": 0.3,
+        "threshold_low": 0.1
+      },
+      "clustering": {
+        "agglomerative": {
+          "distance_threshold": 0.7,
+          "linkage": "average",
+          "n_clusters": null
+        },
+        "algorithm": "graph_threshold",
+        "dbscan": {
+          "eps": 0.5,
+          "min_samples": 5
+        },
+        "embeddings": {
+          "model": null,
+          "normalize": true
+        },
+        "kmeans": {
+          "max_iter": 300,
+          "n_clusters": 20,
+          "n_init": 10
+        },
+        "max_cluster_size": 5,
+        "random_state": 42,
+        "similarity": "cosine",
+        "tfidf": {
+          "max_df": 1.0,
+          "max_features": null,
+          "min_df": 1,
+          "ngram_range": [
+            1,
+            1
+          ]
+        },
+        "threshold": 0.6903486338167011,
+        "vectorizer": "tfidf"
+      },
+      "clustering_max_passages": 200,
+      "doc_candidates_depth": 5000,
+      "doc_content_topk": 5000,
+      "doc_feature_aggregation": "max",
+      "doc_retrieval": {
+        "b": 0.2750076706717374,
+        "k1": 0.6895366011206422,
+        "model": "bm25+rm3",
+        "qld_mu": 1000,
+        "rm3_fb_docs": 80,
+        "rm3_fb_terms": 17,
+        "rm3_original_query_weight": 0.3476334304965827
+      },
+      "enabled_features": [],
+      "feature_max_pairwise_sim": 2000,
+      "final": {
+        "cluster_score_blend": {
+          "alpha": 0.5,
+          "seed_norm": "minmax",
+          "svm_norm": "minmax"
+        },
+        "lambda_max": 0.9711849860299857,
+        "lambda_min": 0.9158460461010892,
+        "max_passages_per_doc": 200,
+        "rr_k": 27,
+        "use_svm_cluster_scores": false
+      },
+      "label_rel_threshold": 1,
+      "max_chars_per_sentence_soft": 300,
+      "max_sentences": 10,
+      "min_sentences": 3,
+      "passage_cache": {
+        "dir": "cache/ranked_passages",
+        "enabled": false
+      },
+      "passage_rerank": {
+        "beta": 0.9995372706276248,
+        "cluster_norm": "zscore",
+        "cluster_scale": 1.0,
+        "cluster_score_agg": "max",
+        "passage_norm": "minmax",
+        "passage_scale": 1.0
+      },
+      "passage_retrieval": {
+        "b": 0.5103364958722995,
+        "k1": 0.3874219424889825,
+        "lucene": {
+          "cache_dir": "cache/passage_lucene",
+          "mode": "cache",
+          "rm3": {
+            "enabled": true,
+            "fb_docs": 22,
+            "fb_terms": 83,
+            "original_query_weight": 0.19103252998859516
+          },
+          "use_all_passages": true
+        },
+        "model": "lucene_bm25+rm3",
+        "per_doc": true,
+        "per_doc_filter": "overlap",
+        "per_doc_filter_k": 10
+      },
+      "rerank": {
+        "alpha": 0.8,
+        "rrf_norm": "minmax",
+        "rrf_scale": 1.0,
+        "topn": 1000
+      },
+      "rrf": {
+        "depth": 200,
+        "k": 94
+      },
+      "semantic_expansion": {
+        "backend": "nltk_wordnet",
+        "enabled": false,
+        "max_terms": 5,
+        "nltk_lemma_max_per_noun": 5,
+        "synonyms": {}
+      },
+      "stride_sentences": 2,
+      "svm": {
+        "C": 1.0,
+        "backend": "svm_rank",
+        "class_weight": "balanced",
+        "max_iter": 5000,
+        "model_path": "models/clustpsg_svm.pkl",
+        "random_state": 42,
+        "svm_rank_classify_bin": "svm_rank/svm_rank_classify",
+        "svm_rank_feature_norm": "minmax",
+        "svm_rank_learn_bin": "svm_rank/svm_rank_learn",
+        "svm_rank_model_path": "models/svmrank.model",
+        "svm_rank_work_dir": "models/svmrank_work"
+      },
+      "train_doc_content_topk": null,
+      "train_docs_source": "retrieved",
+      "train_include_all_qrels_docs": true
+    }
+  },
+  "best_trial_number": 136,
+  "best_trial_params_flat": {
+    "clustering.threshold": 0.6903486338167011,
+    "final.lambda_max": 0.9711849860299857,
+    "final.lambda_min": 0.9158460461010892,
+    "final.rr_k": 27,
+    "passage_rerank.beta": 0.9995372706276248,
+    "passage_retrieval.b": 0.5103364958722995,
+    "passage_retrieval.k1": 0.3874219424889825,
+    "passage_retrieval.lucene.rm3.fb_docs": 22,
+    "passage_retrieval.lucene.rm3.fb_terms": 83,
+    "passage_retrieval.lucene.rm3.original_query_weight": 0.19103252998859516,
+    "rrf.k": 94
+  },
+  "index": "robust04",
+  "last_trial_number": 149,
+  "last_trial_params_flat": {
+    "clustering.threshold": 0.802180033034527,
+    "final.lambda_max": 0.9852295759352574,
+    "final.lambda_min": 0.9851415229654916,
+    "final.rr_k": 28,
+    "passage_rerank.beta": 0.967713978847808,
+    "passage_retrieval.b": 0.5184409141606247,
+    "passage_retrieval.k1": 0.3465126987527141,
+    "passage_retrieval.lucene.rm3.fb_docs": 34,
+    "passage_retrieval.lucene.rm3.fb_terms": 75,
+    "passage_retrieval.lucene.rm3.original_query_weight": 0.1316980847188638,
+    "rrf.k": 112
+  },
+  "last_trial_state": "TrialState.COMPLETE",
+  "last_trial_value": 0.2732525634580074,
+  "metric": {
+    "name": "MAP@1000",
+    "value": 0.28583728317636325
+  },
+  "topk": 1000,
+  "updated_at_unix": 1768676543
+}

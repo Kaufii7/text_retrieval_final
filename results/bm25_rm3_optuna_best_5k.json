@@ -1,0 +1,20 @@
+{
+  "approach": "bm25",
+  "how_to_run": ".venv/bin/python main.py --approach bm25 --split train --topk 5000 --k1 0.275008 --b 0.689537 --rm3 --rm3-fb-terms 80 --rm3-fb-docs 17 --rm3-orig-weight 0.347633 --qe none",
+  "index": "robust04",
+  "metric": {
+    "name": "MAP@5000",
+    "value": 0.28140454481945854
+  },
+  "notes": "Optuna-tuned BM25+RM3 params for Approach1.",
+  "params": {
+    "b": 0.6895366011206422,
+    "k1": 0.2750076706717374,
+    "rm3": {
+      "fb_docs": 17,
+      "fb_terms": 80,
+      "original_query_weight": 0.3476334304965827
+    }
+  },
+  "topk": 5000
+}

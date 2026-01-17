@@ -10,6 +10,8 @@ This module is intentionally lightweight and dependency-free.
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Dict, Iterable, List, Mapping, Sequence
 
 from rag.config import ApproachConfig
@@ -241,4 +243,35 @@ def expand_query_text_semantic(
     expanded = expand_query_terms_semantic(query_terms=terms, cfg=cfg)
     return " ".join(expanded)
 
+
+def expand_query_text_reque_wordnet(
+    *,
+    query_text: str,
+    topn: int = 3,
+    replace: bool = False,
+    reque_qe_dir: str | None = None,
+) -> str:
+    """Expand a raw query string using ReQue's WordNet expander (string -> string).
+
+    Notes:
+    - This is intentionally an optional integration: imports are performed lazily so
+      Approach #1 can run without ReQue / NLTK installed.
+    - By default, assumes ReQue is checked out at repo root under `ReQue/qe/`.
+    """
+    if not isinstance(query_text, str) or not query_text.strip():
+        return ""
+
+    if reque_qe_dir is None:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        reque_qe_dir = os.path.join(repo_root, "ReQue", "qe")
+
+    # Ensure we can import ReQue `qe/` as a top-level module set (expanders/, cmn/, ...)
+    if reque_qe_dir not in sys.path:
+        sys.path.insert(0, reque_qe_dir)
+
+    # Lazy import to keep base usage dependency-light.
+    from expanders.wordnet import Wordnet  # type: ignore
+
+    exp = Wordnet(replace=bool(replace), topn=int(topn))
+    return exp.get_expanded_query(query_text)
 

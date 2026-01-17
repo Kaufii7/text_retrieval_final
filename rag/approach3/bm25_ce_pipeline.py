@@ -44,6 +44,16 @@ def _require_ce_deps():
         ) from e
 
 
+def _require_monot5_deps():
+    try:
+        import torch  # noqa: F401
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # noqa: F401
+    except Exception as e:
+        raise RuntimeError(
+            "MonoT5 scoring requires optional deps: torch + transformers (AutoTokenizer/AutoModelForSeq2SeqLM)."
+        ) from e
+
+
 def _configure_logging(*, level: str) -> logging.Logger:
     log = logging.getLogger("rag.approach3.bm25_ce_pipeline")
     log.setLevel(getattr(logging, str(level).upper(), logging.INFO))
@@ -172,6 +182,20 @@ def _score_pairs_hf(
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoConfig
 
+    dev_str = str(device or "cpu")
+    if dev_str.startswith("cuda") and not torch.cuda.is_available():
+        if log is not None:
+            log.warning("CUDA requested (%s) but not available; falling back to cpu.", dev_str)
+        dev_str = "cpu"
+    if dev_str == "mps" and not getattr(torch.backends, "mps", None):
+        if log is not None:
+            log.warning("MPS requested but torch.backends.mps missing; falling back to cpu.")
+        dev_str = "cpu"
+    if dev_str == "mps" and not torch.backends.mps.is_available():
+        if log is not None:
+            log.warning("MPS requested but not available; falling back to cpu.")
+        dev_str = "cpu"
+
     # Check if it's a local path vs HuggingFace Hub ID
     model_path = str(model_name_or_dir)
     is_local = os.path.isdir(model_path)
@@ -186,7 +210,7 @@ def _score_pairs_hf(
         tok = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForSequenceClassification.from_pretrained(model_path)
     model.eval()
-    dev = torch.device(str(device))
+    dev = torch.device(dev_str)
     model.to(dev)
 
     scores: List[float] = []
@@ -209,6 +233,127 @@ def _score_pairs_hf(
             else:
                 s = logits.view(-1)
             scores.extend([float(x) for x in s.detach().cpu().tolist()])
+            if log is not None:
+                done = min(len(pairs), i + len(batch_pairs))
+                if (b_idx % log_every) == 0 or done == len(pairs):
+                    elapsed = time.perf_counter() - t0
+                    rate = done / elapsed if elapsed > 1e-9 else 0.0
+                    log.info(
+                        "%s progress: pairs=%d/%d batches=%d elapsed=%.1fs rate=%.1f pairs/s",
+                        str(log_prefix),
+                        int(done),
+                        int(len(pairs)),
+                        int(b_idx),
+                        float(elapsed),
+                        float(rate),
+                    )
+    return scores
+
+
+def _score_pairs_monot5_hf(
+    *,
+    model_name_or_dir: str,
+    pairs: Sequence[Tuple[str, str]],
+    device: str,
+    batch_size: int,
+    max_length: int,
+    torch_dtype: str = "auto",
+    log: Optional[logging.Logger] = None,
+    log_prefix: str = "MonoT5",
+    log_every_batches: int = 10,
+) -> List[float]:
+    """Score (query, doc_text) pairs with MonoT5 (seq2seq) using "true/false" log-prob."""
+    _require_monot5_deps()
+    import os
+    from pathlib import Path
+
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+    dev_str = str(device or "cpu")
+    if dev_str.startswith("cuda") and not torch.cuda.is_available():
+        if log is not None:
+            log.warning("CUDA requested (%s) but not available; falling back to cpu.", dev_str)
+        dev_str = "cpu"
+    if dev_str == "mps" and not getattr(torch.backends, "mps", None):
+        if log is not None:
+            log.warning("MPS requested but torch.backends.mps missing; falling back to cpu.")
+        dev_str = "cpu"
+    if dev_str == "mps" and not torch.backends.mps.is_available():
+        if log is not None:
+            log.warning("MPS requested but not available; falling back to cpu.")
+        dev_str = "cpu"
+
+    # Map dtype string to torch dtype / 'auto'
+    td_raw = str(torch_dtype or "auto")
+    if td_raw.lower() == "auto":
+        td_arg = "auto"
+    else:
+        td_arg = getattr(torch, td_raw, None)
+        if td_arg is None:
+            if log is not None:
+                log.warning("Unknown torch_dtype=%s; falling back to 'auto'", td_raw)
+            td_arg = "auto"
+
+    # Check if it's a local path vs HuggingFace Hub ID
+    model_path = str(model_name_or_dir)
+    is_local = os.path.isdir(model_path)
+    if is_local:
+        local_path = Path(model_path).resolve()
+        tok = AutoTokenizer.from_pretrained(local_path)
+        model = AutoModelForSeq2SeqLM.from_pretrained(local_path, torch_dtype=td_arg)
+    else:
+        tok = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_path, torch_dtype=td_arg)
+
+    model.eval()
+    dev = torch.device(dev_str)
+    model.to(dev)
+
+    true_ids = tok.encode("true", add_special_tokens=False)
+    false_ids = tok.encode("false", add_special_tokens=False)
+    if not true_ids or not false_ids:
+        raise RuntimeError("Tokenizer could not encode 'true'/'false' token ids")
+    true_token_id = int(true_ids[0])
+    false_token_id = int(false_ids[0])
+
+    decoder_start_id = getattr(getattr(model, "config", None), "decoder_start_token_id", None)
+    if decoder_start_id is None:
+        decoder_start_id = getattr(tok, "pad_token_id", None)
+    if decoder_start_id is None:
+        decoder_start_id = 0
+
+    def _prompt(q: str, d: str) -> str:
+        return f"Query: {q} Document: {d} Relevant:"
+
+    scores: List[float] = []
+    bs = max(1, int(batch_size))
+    log_every = max(1, int(log_every_batches))
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        for b_idx, i in enumerate(range(0, len(pairs), bs), start=1):
+            batch_pairs = pairs[i : i + bs]
+            prompts = [_prompt(q, d) for q, d in batch_pairs]
+            enc = tok(
+                prompts,
+                truncation=True,
+                padding=True,
+                max_length=int(max_length),
+                return_tensors="pt",
+            )
+            enc = {k: v.to(dev) for k, v in enc.items()}
+            decoder_input_ids = torch.full(
+                (int(len(prompts)), 1),
+                int(decoder_start_id),
+                dtype=torch.long,
+                device=dev,
+            )
+            logits = model(**enc, decoder_input_ids=decoder_input_ids).logits  # [B,1,V]
+            step_logits = logits[:, 0, :]
+            log_probs = torch.log_softmax(step_logits, dim=-1)
+            s = log_probs[:, true_token_id] - log_probs[:, false_token_id]
+            scores.extend([float(x) for x in s.detach().cpu().tolist()])
+
             if log is not None:
                 done = min(len(pairs), i + len(batch_pairs))
                 if (b_idx % log_every) == 0 or done == len(pairs):
@@ -255,7 +400,10 @@ def bm25_to_ce_topk(
     alpha: float,
     docid_to_row: Dict[str, int],
     embeddings: np.ndarray,
+    reranker_type: str,
     ce_model: str,
+    monot5_model: str,
+    monot5_torch_dtype: str,
     ce_device: str,
     ce_batch_size: int,
     ce_max_length: int,
@@ -299,16 +447,30 @@ def bm25_to_ce_topk(
             doc_texts.append(fetch_doc_contents(searcher, docid))
 
     pairs = [(query, t) for t in doc_texts]
-    ce_scores = _score_pairs_hf(
-        model_name_or_dir=str(ce_model),
-        pairs=pairs,
-        device=str(ce_device),
-        batch_size=int(ce_batch_size),
-        max_length=int(ce_max_length),
-        log=log,
-        log_prefix=str(ce_log_prefix),
-        log_every_batches=int(ce_log_every_batches),
-    )
+    rr_type = str(reranker_type or "ce").lower().strip()
+    if rr_type == "monot5":
+        ce_scores = _score_pairs_monot5_hf(
+            model_name_or_dir=str(monot5_model),
+            pairs=pairs,
+            device=str(ce_device),
+            batch_size=int(ce_batch_size),
+            max_length=int(ce_max_length),
+            torch_dtype=str(monot5_torch_dtype),
+            log=log,
+            log_prefix=str(ce_log_prefix).replace("CE", "MonoT5"),
+            log_every_batches=int(ce_log_every_batches),
+        )
+    else:
+        ce_scores = _score_pairs_hf(
+            model_name_or_dir=str(ce_model),
+            pairs=pairs,
+            device=str(ce_device),
+            batch_size=int(ce_batch_size),
+            max_length=int(ce_max_length),
+            log=log,
+            log_prefix=str(ce_log_prefix),
+            log_every_batches=int(ce_log_every_batches),
+        )
 
     # 4) Compute final score:
     #    - normalize BM25 scores and CE scores separately (min-max within this query)
@@ -359,7 +521,7 @@ def bm25_to_ce_topk(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="BM25@5k -> CE rerank -> top1k pipeline (with embedding alignment).")
+    p = argparse.ArgumentParser(description="BM25@5k -> rerank -> top1k pipeline (with embedding alignment).")
     p.add_argument("--index", default="robust04")
     p.add_argument("--queries", default=None, help="Optional queries file (queriesROBUST.txt format).")
     p.add_argument("--query", default=None, help="Single query string (if --queries is not used).")
@@ -384,19 +546,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--rerank-depth",
         type=int,
         default=5000,
-        help="How many of the top BM25 candidates to rerank with the cross-encoder (default: 5000).",
+        help="How many of the top BM25 candidates to rerank with the reranker (default: 5000).",
     )
     p.add_argument(
         "--ce-log-every-batches",
         type=int,
         default=10,
-        help="Log CE scoring progress every N batches (default: 10).",
+        help="Log reranker scoring progress every N batches (default: 10).",
     )
     p.add_argument(
         "--alpha",
         type=float,
         default=0.2,
-        help="Blend weight for CE in final score: final=(1-alpha)*lex + alpha*ce (default: 0.2).",
+        help="Blend weight for reranker in final score: final=(1-alpha)*lex + alpha*rerank (default: 0.2).",
     )
 
     # Embeddings
@@ -407,8 +569,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--corpus-jsonl", default=None, help="Optional corpus JSONL to fetch doc text without Lucene doc().")
     p.add_argument("--corpus-index-db", default=None, help="Optional SQLite offset index path for corpus JSONL.")
 
-    # Cross-encoder
-    p.add_argument("--ce-model", required=True, help="HF model name or local directory for CE.")
+    # Reranker
+    p.add_argument(
+        "--reranker-type",
+        choices=["ce", "monot5"],
+        default="ce",
+        help="Which reranker to use: 'ce' (sequence classification) or 'monot5' (seq2seq true/false).",
+    )
+    p.add_argument("--ce-model", default=None, help="HF model name or local directory for CE (required when --reranker-type=ce).")
+    p.add_argument(
+        "--monot5-model",
+        default="castorini/monot5-3b-msmarco-10k",
+        help="HF model id or local dir for MonoT5 (used when --reranker-type=monot5).",
+    )
+    p.add_argument(
+        "--monot5-torch-dtype",
+        default="auto",
+        help="Torch dtype for MonoT5 loading (e.g. auto/float16/bfloat16/float32). Default: auto.",
+    )
     p.add_argument("--ce-device", default="cpu")
     p.add_argument("--ce-batch-size", type=int, default=16)
     p.add_argument("--ce-max-length", type=int, default=256)
@@ -423,6 +601,11 @@ def main() -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+    rr_type = str(getattr(args, "reranker_type", "ce") or "ce").lower().strip()
+    if rr_type == "ce" and (args.ce_model is None or not str(args.ce_model).strip()):
+        raise SystemExit("--ce-model is required when --reranker-type=ce")
+    rr_prefix = "MonoT5" if rr_type == "monot5" else "CE"
 
     searcher = get_searcher(str(args.index))
     set_bm25(searcher, k1=float(args.bm25_k1), b=float(args.bm25_b))
@@ -477,14 +660,17 @@ def main() -> int:
                     alpha=float(args.alpha),
                     docid_to_row=docid_to_row,
                     embeddings=emb,
+                    reranker_type=str(args.reranker_type),
                     ce_model=str(args.ce_model),
+                    monot5_model=str(args.monot5_model),
+                    monot5_torch_dtype=str(args.monot5_torch_dtype),
                     ce_device=str(args.ce_device),
                     ce_batch_size=int(args.ce_batch_size),
                     ce_max_length=int(args.ce_max_length),
                     corpus_lookup=corpus_lookup,
                     log=log,
                     ce_log_every_batches=int(args.ce_log_every_batches),
-                    ce_log_prefix=f"CE topic={int(q.topic_id)}",
+                    ce_log_prefix=f"{rr_prefix} topic={int(q.topic_id)}",
                 )
                 results_by_topic[int(q.topic_id)] = [(c.docid, float(c.final_score)) for c in top]
                 log.info(
@@ -513,7 +699,10 @@ def main() -> int:
                 alpha=float(args.alpha),
                 docid_to_row=docid_to_row,
                 embeddings=emb,
+                reranker_type=str(args.reranker_type),
                 ce_model=str(args.ce_model),
+                monot5_model=str(args.monot5_model),
+                monot5_torch_dtype=str(args.monot5_torch_dtype),
                 ce_device=str(args.ce_device),
                 ce_batch_size=int(args.ce_batch_size),
                 ce_max_length=int(args.ce_max_length),
@@ -522,7 +711,7 @@ def main() -> int:
             )
             for i, c in enumerate(top, start=1):
                 print(
-                    f"{i}\t{c.docid}\tce={c.ce_score:.6f}\tbm25={c.bm25_score:.6f}\tfinal={c.final_score:.6f}\trow={c.emb_row}"
+                    f"{i}\t{c.docid}\t{rr_prefix.lower()}={c.ce_score:.6f}\tbm25={c.bm25_score:.6f}\tfinal={c.final_score:.6f}\trow={c.emb_row}"
                 )
             return 0
 

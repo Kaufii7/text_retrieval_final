@@ -20,6 +20,9 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+.$*
+*.dtmp
+*.bkp
 
 # Local outputs / artifacts
 *.res
@@ -27,6 +30,10 @@ dist/
 *.csv
 *.log
 data/
+
+# Large model/data artifacts (do not commit)
+*.safetensors
+corpus_top5000_train.jsonl
 
 # Caches
 cache/

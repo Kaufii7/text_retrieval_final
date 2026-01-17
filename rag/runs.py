@@ -103,8 +103,6 @@ def load_trec_run_topic_ids(path: str) -> List[int]:
                 out.append(topic_id)
     out.sort()
     return out
-
-
 def append_trec_run_topic(
     *,
     output_path: str,

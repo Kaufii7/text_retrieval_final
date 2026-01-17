@@ -393,12 +393,16 @@ def rank_passages(
                 scored.append((s, Passage(document_id=p.document_id, index=p.index, content=p.content, score=s)))
 
             scored.sort(key=lambda x: (-x[0], x[1].document_id, x[1].index))
-            results_by_topic[q.id] = [p for _s, p in scored[:topk]]    dt = time.perf_counter() - t0
+            results_by_topic[q.id] = [p for _s, p in scored[:topk]]
+
+    dt = time.perf_counter() - t0
     stage_str = f", stage={stage}" if stage else ""
     if per_doc:
         mode_str = f", mode=per_doc(filter={per_doc_filter},k={per_doc_filter_k})"
     else:
-        mode_str = ", mode=global"    log.info(
+        mode_str = ", mode=global"
+
+    log.info(
         "Ranked passages for %d queries (topk=%d, model=%s, passages=%d%s%s) in %.2fs.",
         len(queries),
         topk,
