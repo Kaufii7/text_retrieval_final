@@ -51,7 +51,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from rag.io import load_qrels, load_queries
-from rag.lucene_backend import fetch_doc_contents, get_searcher, search, set_bm25
+from rag.lucene_backend import fetch_doc_contents, get_searcher, search, set_bm25, set_rm3
 from rag.types import Query
 
 
@@ -137,6 +137,29 @@ def _split_topics_kfold(topics: Sequence[int], *, k: int, seed: int) -> List[Lis
 
 def _topic_queries(queries: Sequence[Query]) -> Dict[int, Query]:
     return {int(q.id): q for q in queries}
+
+
+def _load_bm25_rm3_params(path: str) -> Dict[str, object]:
+    """Load Optuna-tuned BM25+RM3 params JSON (repo artifact) in a tolerant way."""
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError(f"{path}: expected JSON object")
+    params = obj.get("params") or {}
+    if not isinstance(params, dict):
+        raise ValueError(f"{path}: expected params dict")
+    rm3 = params.get("rm3") or {}
+    if not isinstance(rm3, dict):
+        rm3 = {}
+    return {
+        "k1": float(params.get("k1", 0.9)),
+        "b": float(params.get("b", 0.4)),
+        "rm3_fb_terms": int(rm3.get("fb_terms", 50)),
+        "rm3_fb_docs": int(rm3.get("fb_docs", 50)),
+        "rm3_orig_weight": float(rm3.get("original_query_weight", 0.2)),
+        "topk": int(obj.get("topk", 5000)),
+        "source_path": str(path),
+    }
 
 
 def _build_examples_for_topics(
@@ -723,6 +746,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Data / sampling
     p.add_argument("--folds", type=int, default=5)
+    p.add_argument(
+        "--start-fold",
+        type=int,
+        default=0,
+        help="Start training from this fold index (default: 0). Useful to resume a specific fold.",
+    )
+    p.add_argument(
+        "--only-fold",
+        type=int,
+        default=None,
+        help="If set, train only this fold index and exit (useful for debugging/resuming a single fold).",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--label-rel-threshold", type=int, default=1)
     p.add_argument(
@@ -734,6 +769,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bm25-k1", type=float, default=0.9)
     p.add_argument("--bm25-b", type=float, default=0.4)
     p.add_argument(
+        "--negatives-retriever",
+        choices=["bm25", "bm25_rm3"],
+        default="bm25",
+        help="Which first-stage retriever to use for negative sampling (default: bm25).",
+    )
+    p.add_argument(
+        "--bm25-rm3-params-json",
+        default="results/bm25_rm3_optuna_best_5k.json",
+        help="Path to Optuna-tuned BM25+RM3 params JSON (used when --negatives-retriever=bm25_rm3).",
+    )
+    p.add_argument("--rm3-fb-terms", type=int, default=None, help="Override RM3 fb_terms (only for bm25_rm3).")
+    p.add_argument("--rm3-fb-docs", type=int, default=None, help="Override RM3 fb_docs (only for bm25_rm3).")
+    p.add_argument(
+        "--rm3-orig-weight",
+        type=float,
+        default=None,
+        help="Override RM3 original_query_weight (only for bm25_rm3).",
+    )
+    p.add_argument(
         "--max-pos-per-topic",
         type=int,
         default=0,
@@ -744,7 +798,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Model / training
     p.add_argument("--base-model", default="castorini/monot5-base-msmarco")
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="gpu")
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--grad-accum-steps", type=int, default=32)
@@ -813,17 +867,66 @@ def main() -> int:
 
     # Pyserini searcher for negative sampling and doc fetching.
     searcher = get_searcher(str(args.index))
-    set_bm25(searcher, k1=float(args.bm25_k1), b=float(args.bm25_b))
+    neg_retriever = str(getattr(args, "negatives_retriever", "bm25") or "bm25").lower().strip()
+    if neg_retriever == "bm25_rm3":
+        tuned = _load_bm25_rm3_params(str(getattr(args, "bm25_rm3_params_json", "results/bm25_rm3_optuna_best_5k.json")))
+        # Allow explicit overrides from CLI
+        k1 = float(tuned["k1"])
+        b = float(tuned["b"])
+        bm25_topk = int(tuned["topk"])
+        fb_terms = int(tuned["rm3_fb_terms"]) if args.rm3_fb_terms is None else int(args.rm3_fb_terms)
+        fb_docs = int(tuned["rm3_fb_docs"]) if args.rm3_fb_docs is None else int(args.rm3_fb_docs)
+        orig_w = float(tuned["rm3_orig_weight"]) if args.rm3_orig_weight is None else float(args.rm3_orig_weight)
+
+        # Respect explicit --bm25-topk override (sampling depth)
+        if args.bm25_topk is not None:
+            bm25_topk = int(args.bm25_topk)
+
+        set_bm25(searcher, k1=float(k1), b=float(b))
+        set_rm3(searcher, fb_terms=int(fb_terms), fb_docs=int(fb_docs), original_query_weight=float(orig_w))
+        log.info(
+            "Negative sampling retriever: BM25+RM3 (tuned) k1=%.6f b=%.6f topk=%d rm3_fb_terms=%d rm3_fb_docs=%d rm3_orig_weight=%.6f (source=%s)",
+            float(k1),
+            float(b),
+            int(bm25_topk),
+            int(fb_terms),
+            int(fb_docs),
+            float(orig_w),
+            str(tuned.get("source_path", "")),
+        )
+        # Mutate args so downstream uses the correct depth + logs are consistent.
+        args.bm25_k1 = float(k1)
+        args.bm25_b = float(b)
+        args.bm25_topk = int(bm25_topk)
+    else:
+        set_bm25(searcher, k1=float(args.bm25_k1), b=float(args.bm25_b))
     doc_cache = _DocTextCache(lambda d: fetch_doc_contents(searcher, d), max_items=50_000)
 
-    folds = _split_topics_kfold(topics, k=int(args.folds), seed=int(args.seed))
+    n_folds = int(args.folds)
+    if n_folds <= 0:
+        raise SystemExit("--folds must be >= 1")
+    folds = _split_topics_kfold(topics, k=n_folds, seed=int(args.seed))
     log.info("Prepared %d folds (topic-level).", int(len(folds)))
 
     # Parse LoRA target modules
     ltm = [s.strip() for s in str(args.lora_target_modules or "").split(",") if s.strip()]
     fold_reports: List[Dict[str, object]] = []
 
-    for fold_idx in range(int(args.folds)):
+    start_fold = int(getattr(args, "start_fold", 0) or 0)
+    if start_fold < 0:
+        start_fold = 0
+    only_fold = getattr(args, "only_fold", None)
+    if only_fold is not None:
+        only_fold = int(only_fold)
+        if only_fold < 0 or only_fold >= n_folds:
+            raise SystemExit(f"--only-fold must be in [0, {n_folds - 1}]")
+        fold_indices = [only_fold]
+    else:
+        if start_fold >= n_folds:
+            raise SystemExit(f"--start-fold must be in [0, {n_folds - 1}]")
+        fold_indices = list(range(start_fold, n_folds))
+
+    for fold_idx in fold_indices:
         dev_topics = list(folds[fold_idx])
         train_topics = [t for i, f in enumerate(folds) if i != fold_idx for t in f]
         log.info(

@@ -1,16 +1,15 @@
-"""BM25 -> embedding mapping -> cross-encoder rerank pipeline.
+"""BM25 -> rerank pipeline (optionally keeping dense embeddings aligned).
 
 Pipeline (per query):
 1) Retrieve 5k docs using BM25 (Pyserini / Lucene).
-2) Map each document (docid) to the correct embedding row using docids.txt.
+2) (Optional) Map each document (docid) to the correct embedding row using docids.txt.
 3) Score candidates with a cross-encoder (HuggingFace seq-classification) using (query, doc_text).
-4) Re-order the *embeddings* according to the cross-encoder score.
-5) Re-map the reordered embeddings back to original docids.
-6) Return top-1000 docids (and optionally embeddings/scores).
+4) (Optional) Re-order the *embeddings* according to the reranker score.
+5) Return top-1000 docids (and optionally embeddings/scores).
 
 Notes:
 - Step (3) fundamentally requires *text* (a cross-encoder scores text pairs), not raw embeddings.
-  We keep embeddings aligned throughout, as requested.
+- Embeddings are only needed if you explicitly want embedding-row alignment alongside reranked docids.
 - For doc text, prefer `--corpus-jsonl` to avoid extra Java calls; otherwise we fall back
   to Pyserini `fetch_doc_contents(searcher, docid)`.
 """
@@ -390,6 +389,102 @@ def _minmax(scores: Sequence[float]) -> List[float]:
     return [(float(s) - mn) / (mx - mn) for s in scores]
 
 
+def _score_pairs_monot5_ensemble(
+    *,
+    model_names_or_dirs: Sequence[str],
+    pairs: Sequence[Tuple[str, str]],
+    device: str,
+    batch_size: int,
+    max_length: int,
+    torch_dtype: str,
+    log: Optional[logging.Logger] = None,
+    log_prefix: str = "MonoT5",
+) -> List[float]:
+    """Score pairs with multiple MonoT5 models and average per-model minmax-normalized scores.
+
+    This is a simple (and robust) k-fold ensemble:
+      score_f = MonoT5_f(pairs)
+      norm_f  = minmax(score_f)   (per query)
+      out     = mean_f(norm_f)
+    """
+    if not model_names_or_dirs:
+        return []
+
+    # Import lazily; this keeps the module import-safe when transformers/torch aren't installed.
+    from rag.rerankers.monot5 import MonoT5Reranker
+
+    all_norm: List[List[float]] = []
+    for mi, model_id in enumerate(model_names_or_dirs, start=1):
+        if log is not None:
+            log.info("%s ensemble: scoring with model %d/%d: %s", str(log_prefix), mi, len(model_names_or_dirs), str(model_id))
+        r = MonoT5Reranker(
+            model_name=str(model_id),
+            device=str(device),
+            batch_size=int(batch_size),
+            max_length=int(max_length),
+            torch_dtype=str(torch_dtype),
+        )
+        scores = r.score_pairs(pairs[0][0] if pairs else "", [d for _q, d in pairs]) if pairs else []
+        # Per-model minmax normalize for stability across folds
+        all_norm.append(_minmax(scores))
+
+        # Best-effort free GPU memory between models
+        try:
+            if str(device).startswith("cuda"):
+                import torch
+
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    # Average across models
+    n = len(all_norm[0]) if all_norm else 0
+    out = []
+    for i in range(n):
+        out.append(float(sum(float(v[i]) for v in all_norm)) / float(len(all_norm)))
+    return out
+
+
+def _score_pairs_ce_ensemble(
+    *,
+    model_names_or_dirs: Sequence[str],
+    pairs: Sequence[Tuple[str, str]],
+    device: str,
+    batch_size: int,
+    max_length: int,
+    log: Optional[logging.Logger] = None,
+    log_prefix: str = "CE",
+    log_every_batches: int = 10,
+) -> List[float]:
+    """Score pairs with multiple CE models and average per-model minmax-normalized scores."""
+    if not model_names_or_dirs:
+        return []
+    all_norm: List[List[float]] = []
+    for mi, model_id in enumerate(model_names_or_dirs, start=1):
+        if log is not None:
+            log.info("%s ensemble: scoring with model %d/%d: %s", str(log_prefix), mi, len(model_names_or_dirs), str(model_id))
+        scores = _score_pairs_hf(
+            model_name_or_dir=str(model_id),
+            pairs=pairs,
+            device=str(device),
+            batch_size=int(batch_size),
+            max_length=int(max_length),
+            log=log,
+            log_prefix=str(log_prefix),
+            log_every_batches=int(log_every_batches),
+        )
+        all_norm.append(_minmax(scores))
+        try:
+            if str(device).startswith("cuda"):
+                import torch
+
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    n = len(all_norm[0]) if all_norm else 0
+    return [float(sum(float(v[i]) for v in all_norm)) / float(len(all_norm)) for i in range(n)]
+
+
 def bm25_to_ce_topk(
     *,
     query: str,
@@ -398,10 +493,10 @@ def bm25_to_ce_topk(
     final_topk: int,
     rerank_depth: int,
     alpha: float,
-    docid_to_row: Dict[str, int],
-    embeddings: np.ndarray,
+    docid_to_row: Optional[Dict[str, int]],
+    embeddings: Optional[np.ndarray],
     reranker_type: str,
-    ce_model: str,
+    ce_model: object,
     monot5_model: str,
     monot5_torch_dtype: str,
     ce_device: str,
@@ -416,21 +511,26 @@ def bm25_to_ce_topk(
     # 1) BM25 retrieve
     hits = search(searcher, query, topk=int(bm25_topk))
     if not hits:
-        return [], np.zeros((0, int(embeddings.shape[1])), dtype=np.float32)
+        dim = int(embeddings.shape[1]) if (embeddings is not None and embeddings.ndim == 2) else 0
+        return [], np.zeros((0, dim), dtype=np.float32)
 
-    # 2) Map docids -> embedding rows (keep order)
+    # 2) Map docids -> embedding rows (keep order), if enabled
     kept: List[Tuple[str, float, int]] = []
     missing = 0
     for h in hits:
+        if docid_to_row is None:
+            kept.append((h.docid, float(h.score), -1))
+            continue
         r = docid_to_row.get(h.docid)
         if r is None:
             missing += 1
             continue
         kept.append((h.docid, float(h.score), int(r)))
-    if missing:
+    if missing and docid_to_row is not None:
         log.warning("Missing embeddings for %d/%d BM25 hits (skipped).", missing, len(hits))
     if not kept:
-        return [], np.zeros((0, int(embeddings.shape[1])), dtype=np.float32)
+        dim = int(embeddings.shape[1]) if (embeddings is not None and embeddings.ndim == 2) else 0
+        return [], np.zeros((0, dim), dtype=np.float32)
 
     # 3) Cross-encoder score using doc_text for the top-N candidates only.
     rd = int(rerank_depth)
@@ -449,28 +549,64 @@ def bm25_to_ce_topk(
     pairs = [(query, t) for t in doc_texts]
     rr_type = str(reranker_type or "ce").lower().strip()
     if rr_type == "monot5":
-        ce_scores = _score_pairs_monot5_hf(
-            model_name_or_dir=str(monot5_model),
-            pairs=pairs,
-            device=str(ce_device),
-            batch_size=int(ce_batch_size),
-            max_length=int(ce_max_length),
-            torch_dtype=str(monot5_torch_dtype),
-            log=log,
-            log_prefix=str(ce_log_prefix).replace("CE", "MonoT5"),
-            log_every_batches=int(ce_log_every_batches),
-        )
+        # Support ensembling across multiple monot5 models (e.g., k-fold checkpoints).
+        monot5_models: List[str] = []
+        if isinstance(monot5_model, (list, tuple)):
+            monot5_models = [str(x) for x in monot5_model if str(x).strip()]
+        else:
+            monot5_models = [str(monot5_model)]
+        if len(monot5_models) > 1:
+            ce_scores = _score_pairs_monot5_ensemble(
+                model_names_or_dirs=monot5_models,
+                pairs=pairs,
+                device=str(ce_device),
+                batch_size=int(ce_batch_size),
+                max_length=int(ce_max_length),
+                torch_dtype=str(monot5_torch_dtype),
+                log=log,
+                log_prefix=str(ce_log_prefix).replace("CE", "MonoT5"),
+            )
+        else:
+            ce_scores = _score_pairs_monot5_hf(
+                model_name_or_dir=str(monot5_models[0]),
+                pairs=pairs,
+                device=str(ce_device),
+                batch_size=int(ce_batch_size),
+                max_length=int(ce_max_length),
+                torch_dtype=str(monot5_torch_dtype),
+                log=log,
+                log_prefix=str(ce_log_prefix).replace("CE", "MonoT5"),
+                log_every_batches=int(ce_log_every_batches),
+            )
     else:
-        ce_scores = _score_pairs_hf(
-            model_name_or_dir=str(ce_model),
-            pairs=pairs,
-            device=str(ce_device),
-            batch_size=int(ce_batch_size),
-            max_length=int(ce_max_length),
-            log=log,
-            log_prefix=str(ce_log_prefix),
-            log_every_batches=int(ce_log_every_batches),
-        )
+        # Support ensembling across multiple CE models (e.g., k-fold checkpoints).
+        ce_models: List[str] = []
+        if isinstance(ce_model, (list, tuple)):
+            ce_models = [str(x) for x in ce_model if str(x).strip()]
+        else:
+            ce_models = [str(ce_model)] if str(ce_model).strip() else []
+        if len(ce_models) > 1:
+            ce_scores = _score_pairs_ce_ensemble(
+                model_names_or_dirs=ce_models,
+                pairs=pairs,
+                device=str(ce_device),
+                batch_size=int(ce_batch_size),
+                max_length=int(ce_max_length),
+                log=log,
+                log_prefix=str(ce_log_prefix),
+                log_every_batches=int(ce_log_every_batches),
+            )
+        else:
+            ce_scores = _score_pairs_hf(
+                model_name_or_dir=str(ce_models[0] if ce_models else ""),
+                pairs=pairs,
+                device=str(ce_device),
+                batch_size=int(ce_batch_size),
+                max_length=int(ce_max_length),
+                log=log,
+                log_prefix=str(ce_log_prefix),
+                log_every_batches=int(ce_log_every_batches),
+            )
 
     # 4) Compute final score:
     #    - normalize BM25 scores and CE scores separately (min-max within this query)
@@ -511,10 +647,13 @@ def bm25_to_ce_topk(
             )
         )
 
-    # 5) Re-map embeddings in the same order
+    # 5) Re-map embeddings in the same order (optional)
     top = reranked[: int(final_topk)]
-    rows = [c.emb_row for c in top]
-    top_emb = embeddings[np.array(rows, dtype=np.int64), :]
+    if embeddings is not None and embeddings.ndim == 2 and docid_to_row is not None:
+        rows = [int(c.emb_row) for c in top if int(c.emb_row) >= 0]
+        top_emb = embeddings[np.array(rows, dtype=np.int64), :] if rows else np.zeros((0, int(embeddings.shape[1])), dtype=np.float32)
+    else:
+        top_emb = np.zeros((0, 0), dtype=np.float32)
 
     # 6) Return top-1000 docs (+ embeddings aligned)
     return top, top_emb
@@ -528,6 +667,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-run", default=None, help="Optional TREC run output path (if using --queries).")
     p.add_argument("--run-tag", default="bm25_ce", help="Run tag for TREC output (if --output-run is set).")
     p.add_argument("--log-level", default="INFO")
+    p.add_argument(
+        "--stream-output",
+        action="store_true",
+        help="When using --queries + --output-run, append each topic's results as it finishes (reduces memory, resumable).",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a streaming run: skip topics already present in --output-run (implies --stream-output).",
+    )
 
     # BM25
     p.add_argument("--bm25-topk", type=int, default=5000)
@@ -561,9 +710,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Blend weight for reranker in final score: final=(1-alpha)*lex + alpha*rerank (default: 0.2).",
     )
 
-    # Embeddings
-    p.add_argument("--embeddings", required=True, help="Embeddings .npy (rows aligned with docids.txt).")
-    p.add_argument("--docids", required=True, help="Docids .txt aligned with embeddings.")
+    # Embeddings (optional)
+    p.add_argument(
+        "--no-embeddings",
+        action="store_true",
+        help="Run BM25 -> rerank without loading/remapping embeddings (pure text reranking).",
+    )
+    p.add_argument("--embeddings", default=None, help="Optional embeddings .npy (rows aligned with docids.txt).")
+    p.add_argument("--docids", default=None, help="Optional docids .txt aligned with embeddings.")
 
     # Doc text source
     p.add_argument("--corpus-jsonl", default=None, help="Optional corpus JSONL to fetch doc text without Lucene doc().")
@@ -576,11 +730,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="ce",
         help="Which reranker to use: 'ce' (sequence classification) or 'monot5' (seq2seq true/false).",
     )
-    p.add_argument("--ce-model", default=None, help="HF model name or local directory for CE (required when --reranker-type=ce).")
+    p.add_argument(
+        "--ce-model",
+        action="append",
+        default=[],
+        help=(
+            "HF model name or local directory for CE (required when --reranker-type=ce). "
+            "Repeat this flag to ensemble multiple CE models (e.g., fold_0..fold_4)."
+        ),
+    )
     p.add_argument(
         "--monot5-model",
-        default="castorini/monot5-3b-msmarco-10k",
-        help="HF model id or local dir for MonoT5 (used when --reranker-type=monot5).",
+        action="append",
+        default=[],
+        help=(
+            "HF model id or local dir for MonoT5 (used when --reranker-type=monot5). "
+            "Repeat this flag to ensemble multiple models (e.g., fold_0..fold_4). "
+            "If omitted, defaults to castorini/monot5-3b-msmarco-10k."
+        ),
     )
     p.add_argument(
         "--monot5-torch-dtype",
@@ -603,9 +770,15 @@ def main() -> int:
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
     rr_type = str(getattr(args, "reranker_type", "ce") or "ce").lower().strip()
-    if rr_type == "ce" and (args.ce_model is None or not str(args.ce_model).strip()):
-        raise SystemExit("--ce-model is required when --reranker-type=ce")
+    if rr_type == "ce":
+        if not getattr(args, "ce_model", None):
+            raise SystemExit("--ce-model is required when --reranker-type=ce")
     rr_prefix = "MonoT5" if rr_type == "monot5" else "CE"
+
+    # Resolve monot5 models list (supports ensemble via repeated --monot5-model).
+    if rr_type == "monot5":
+        if not getattr(args, "monot5_model", None):
+            args.monot5_model = ["castorini/monot5-3b-msmarco-10k"]
 
     searcher = get_searcher(str(args.index))
     set_bm25(searcher, k1=float(args.bm25_k1), b=float(args.bm25_b))
@@ -623,12 +796,24 @@ def main() -> int:
             float(args.rm3_orig_weight),
         )
 
-    log.info("Loading embeddings=%s", str(args.embeddings))
-    emb = np.load(str(args.embeddings), mmap_mode="r")
-    log.info("Loading docids=%s", str(args.docids))
-    docid_to_row = _load_docid_to_row(str(args.docids))
-    if int(emb.shape[0]) != len(docid_to_row):
-        log.warning("Embeddings rows (%d) != docids count (%d). Mapping may be incomplete.", int(emb.shape[0]), len(docid_to_row))
+    use_embeddings = not bool(getattr(args, "no_embeddings", False))
+    emb: Optional[np.ndarray] = None
+    docid_to_row: Optional[Dict[str, int]] = None
+    if use_embeddings:
+        if not args.embeddings or not args.docids:
+            raise SystemExit("When --no-embeddings is NOT set, you must provide both --embeddings and --docids.")
+        log.info("Loading embeddings=%s", str(args.embeddings))
+        emb = np.load(str(args.embeddings), mmap_mode="r")
+        log.info("Loading docids=%s", str(args.docids))
+        docid_to_row = _load_docid_to_row(str(args.docids))
+        if int(emb.shape[0]) != len(docid_to_row):
+            log.warning(
+                "Embeddings rows (%d) != docids count (%d). Mapping may be incomplete.",
+                int(emb.shape[0]),
+                len(docid_to_row),
+            )
+    else:
+        log.info("Embeddings disabled (--no-embeddings): running BM25 -> %s reranking without embedding remapping.", rr_prefix)
 
     corpus_lookup: Optional[_CorpusJsonlLookup] = None
     if args.corpus_jsonl:
@@ -641,6 +826,74 @@ def main() -> int:
             if not args.output_run:
                 raise SystemExit("When using --queries, also provide --output-run to write a TREC run.")
 
+            # Deterministic order
+            qs = sorted(qs, key=lambda q: int(q.topic_id))
+
+            stream = bool(getattr(args, "stream_output", False)) or bool(getattr(args, "resume", False))
+            out_path = str(args.output_run)
+            if stream:
+                from rag.runs import append_trec_run_topic, load_trec_run_topic_ids
+
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                done = set()
+                if bool(getattr(args, "resume", False)) and os.path.exists(out_path):
+                    done = set(load_trec_run_topic_ids(out_path))
+                    log.info("Resuming: found %d completed topics in %s", len(done), out_path)
+                else:
+                    # Fresh streaming run: truncate any existing output.
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write("")
+
+                for q in qs:
+                    topic_id = int(q.topic_id)
+                    if topic_id in done:
+                        continue
+                    t0 = time.perf_counter()
+                    log.info(
+                        "topic=%d start: bm25_topk=%d rerank_depth=%d final_topk=%d",
+                        topic_id,
+                        int(args.bm25_topk),
+                        int(args.rerank_depth),
+                        int(args.final_topk),
+                    )
+                    top, _top_emb = bm25_to_ce_topk(
+                        query=q.text,
+                        searcher=searcher,
+                        bm25_topk=int(args.bm25_topk),
+                        final_topk=int(args.final_topk),
+                        rerank_depth=int(args.rerank_depth),
+                        alpha=float(args.alpha),
+                        docid_to_row=docid_to_row,
+                        embeddings=emb,
+                        reranker_type=str(args.reranker_type),
+                        ce_model=args.ce_model,
+                        monot5_model=args.monot5_model,
+                        monot5_torch_dtype=str(args.monot5_torch_dtype),
+                        ce_device=str(args.ce_device),
+                        ce_batch_size=int(args.ce_batch_size),
+                        ce_max_length=int(args.ce_max_length),
+                        corpus_lookup=corpus_lookup,
+                        log=log,
+                        ce_log_every_batches=int(args.ce_log_every_batches),
+                        ce_log_prefix=f"{rr_prefix} topic={topic_id}",
+                    )
+                    append_trec_run_topic(
+                        output_path=out_path,
+                        topic_id=topic_id,
+                        entries=[(c.docid, float(c.final_score)) for c in top],
+                        run_tag=str(args.run_tag),
+                        topk=int(args.final_topk),
+                    )
+                    log.info(
+                        "topic=%d done: returned=%d elapsed=%.2fs (appended)",
+                        topic_id,
+                        len(top),
+                        time.perf_counter() - t0,
+                    )
+                log.info("Wrote run (streaming): %s", out_path)
+                return 0
+
+            # Non-streaming mode: keep in memory and write at the end
             results_by_topic: Dict[int, List[Tuple[str, float]]] = {}
             for q in qs:
                 t0 = time.perf_counter()
@@ -661,8 +914,8 @@ def main() -> int:
                     docid_to_row=docid_to_row,
                     embeddings=emb,
                     reranker_type=str(args.reranker_type),
-                    ce_model=str(args.ce_model),
-                    monot5_model=str(args.monot5_model),
+                    ce_model=args.ce_model,
+                    monot5_model=args.monot5_model,
                     monot5_torch_dtype=str(args.monot5_torch_dtype),
                     ce_device=str(args.ce_device),
                     ce_batch_size=int(args.ce_batch_size),
@@ -682,11 +935,11 @@ def main() -> int:
 
             write_trec_run(
                 results_by_topic=results_by_topic,
-                output_path=str(args.output_run),
+                output_path=out_path,
                 run_tag=str(args.run_tag),
                 topk=int(args.final_topk),
             )
-            log.info("Wrote run: %s", str(args.output_run))
+            log.info("Wrote run: %s", out_path)
             return 0
 
         if args.query:
@@ -700,8 +953,8 @@ def main() -> int:
                 docid_to_row=docid_to_row,
                 embeddings=emb,
                 reranker_type=str(args.reranker_type),
-                ce_model=str(args.ce_model),
-                monot5_model=str(args.monot5_model),
+                ce_model=args.ce_model,
+                monot5_model=args.monot5_model,
                 monot5_torch_dtype=str(args.monot5_torch_dtype),
                 ce_device=str(args.ce_device),
                 ce_batch_size=int(args.ce_batch_size),
