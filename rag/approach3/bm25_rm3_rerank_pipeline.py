@@ -68,6 +68,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-run", required=True, help="TREC run output path.")
     p.add_argument("--run-tag", default="bm25_rm3_rerank")
     p.add_argument("--log-level", default="INFO")
+    p.add_argument(
+        "--start-topic-id",
+        type=int,
+        default=None,
+        help="If set, skip all topics with topic_id < this value (useful for resuming from a specific query id).",
+    )
 
     p.add_argument(
         "--bm25-rm3-params-json",
@@ -138,6 +144,11 @@ def main() -> int:
     # Load queries
     qs: List[Query] = load_queries(str(args.queries))
     qs = sorted(qs, key=lambda q: int(q.topic_id))
+    if args.start_topic_id is not None:
+        start_id = int(args.start_topic_id)
+        before = len(qs)
+        qs = [q for q in qs if int(q.topic_id) >= start_id]
+        log.info("Starting from topic_id=%d (kept %d/%d topics)", start_id, len(qs), before)
 
     # Doc text lookup
     corpus_lookup: Optional[_CorpusJsonlLookup] = None
